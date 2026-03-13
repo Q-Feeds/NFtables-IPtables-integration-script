@@ -122,6 +122,40 @@ configure_script() {
     read -rp "Enter the limit of IPs to fetch [default: 130000]: " LIMIT
     LIMIT=${LIMIT:-130000}
 
+    # Directional blocking options
+    read -rp "Block INCOMING connections from malicious IPs? [Y/n]: " BLOCK_INCOMING
+    case "$BLOCK_INCOMING" in
+        [nN][oO]|[nN])
+            BLOCK_INCOMING="no"
+            ;;
+        *)
+            BLOCK_INCOMING="yes"
+            ;;
+    esac
+
+    read -rp "Block OUTGOING connections to malicious IPs? [y/N]: " BLOCK_OUTGOING
+    case "$BLOCK_OUTGOING" in
+        [yY][eE][sS]|[yY])
+            BLOCK_OUTGOING="yes"
+            ;;
+        *)
+            BLOCK_OUTGOING="no"
+            ;;
+    esac
+
+    # Optional whitelist
+    read -rp "Configure a whitelist of IPs/CIDRs that must NEVER be blocked? [y/N]: " USE_WHITELIST
+    WHITELIST_V4=""
+    WHITELIST_V6=""
+    case "$USE_WHITELIST" in
+        [yY][eE][sS]|[yY])
+            read -rp "Enter IPv4 whitelist (comma-separated, e.g. 1.2.3.4,5.6.7.8) [leave empty for none]: " WHITELIST_V4
+            read -rp "Enter IPv6 whitelist (comma-separated, e.g. 2001:db8::1,2001:db8::2) [leave empty for none]: " WHITELIST_V6
+            ;;
+        *)
+            ;;
+    esac
+
     # Create configuration file
     cat > "$CONFIG_FILE" <<EOF
 # Q-Feeds Blocklist Configuration
@@ -135,12 +169,24 @@ FEED_TYPE="$FEED_TYPE"
 # Limit of IPs to fetch (optional)
 LIMIT=$LIMIT
 
+# Directional blocking options
+BLOCK_INCOMING="$BLOCK_INCOMING"
+BLOCK_OUTGOING="$BLOCK_OUTGOING"
+
+# Optional whitelist (comma-separated IP/CIDR entries)
+WHITELIST_V4="$WHITELIST_V4"
+WHITELIST_V6="$WHITELIST_V6"
+
 # Log File Location
 LOG_FILE="$LOG_FILE"
 
-# NFTables Set Names
+# NFTables Set Names (blacklists)
 NFT_SET_NAME_V4="qfeeds_blacklist_v4"
 NFT_SET_NAME_V6="qfeeds_blacklist_v6"
+
+# NFTables Set Names (whitelists)
+NFT_WHITELIST_SET_NAME_V4="qfeeds_whitelist_v4"
+NFT_WHITELIST_SET_NAME_V6="qfeeds_whitelist_v6"
 EOF
 
     chmod 600 "$CONFIG_FILE"
@@ -198,38 +244,110 @@ setup_nft() {
 
     # For IPv4
     if nft list table ip qfeeds &>/dev/null; then
-        # Table exists, flush sets or re-create
+        # Table exists, flush blacklist set or re-create
         if nft list set ip qfeeds "$NFT_SET_NAME_V4" &>/dev/null; then
             nft flush set ip qfeeds "$NFT_SET_NAME_V4"
-            LOG "Flushed existing nft set: $NFT_SET_NAME_V4"
+            LOG "Flushed existing nft blacklist set: $NFT_SET_NAME_V4"
         else
             nft add set ip qfeeds "$NFT_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-            LOG "Created nft set: $NFT_SET_NAME_V4"
+            LOG "Created nft blacklist set: $NFT_SET_NAME_V4"
+        fi
+
+        # Whitelist set for IPv4
+        if nft list set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" &>/dev/null; then
+            nft flush set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4"
+            LOG "Flushed existing nft whitelist set: $NFT_WHITELIST_SET_NAME_V4"
+        else
+            nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
+            LOG "Created nft whitelist set: $NFT_WHITELIST_SET_NAME_V4"
         fi
     else
         nft add table ip qfeeds
         nft add set ip qfeeds "$NFT_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-        nft add chain ip qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
-        nft add rule ip qfeeds input-chain ip s @${NFT_SET_NAME_V4} drop
-        LOG "Created nft table qfeeds, set $NFT_SET_NAME_V4, and input-chain rule for IPv4."
+        nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
+        LOG "Created nft table qfeeds and IPv4 sets."
     fi
 
     # For IPv6
     if nft list table ip6 qfeeds &>/dev/null; then
-        # Table exists, flush sets or re-create
+        # Table exists, flush blacklist set or re-create
         if nft list set ip6 qfeeds "$NFT_SET_NAME_V6" &>/dev/null; then
             nft flush set ip6 qfeeds "$NFT_SET_NAME_V6"
-            LOG "Flushed existing nft set: $NFT_SET_NAME_V6"
+            LOG "Flushed existing nft blacklist set: $NFT_SET_NAME_V6"
         else
             nft add set ip6 qfeeds "$NFT_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-            LOG "Created nft set: $NFT_SET_NAME_V6"
+            LOG "Created nft blacklist set: $NFT_SET_NAME_V6"
+        fi
+
+        # Whitelist set for IPv6
+        if nft list set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" &>/dev/null; then
+            nft flush set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6"
+            LOG "Flushed existing nft whitelist set: $NFT_WHITELIST_SET_NAME_V6"
+        else
+            nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
+            LOG "Created nft whitelist set: $NFT_WHITELIST_SET_NAME_V6"
         fi
     else
         nft add table ip6 qfeeds
         nft add set ip6 qfeeds "$NFT_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-        nft add chain ip6 qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
-        nft add rule ip6 qfeeds input-chain ip6 s @${NFT_SET_NAME_V6} drop
-        LOG "Created nft table qfeeds, set $NFT_SET_NAME_V6, and input-chain rule for IPv6."
+        nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
+        LOG "Created nft ip6 qfeeds table and IPv6 sets."
+    fi
+
+    # Chains and rules for IPv4
+    if [ "$BLOCK_INCOMING" = "yes" ]; then
+        if ! nft list chain ip qfeeds input-chain &>/dev/null; then
+            nft add chain ip qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
+            LOG "Created IPv4 input-chain in qfeeds table."
+        fi
+        # Ensure whitelist-then-blacklist rules exist for input chain (IPv4)
+        if ! nft list chain ip qfeeds input-chain | grep -q "ip s @$NFT_WHITELIST_SET_NAME_V4 accept"; then
+            nft add rule ip qfeeds input-chain ip s @${NFT_WHITELIST_SET_NAME_V4} accept
+        fi
+        if ! nft list chain ip qfeeds input-chain | grep -q "ip s @$NFT_SET_NAME_V4 drop"; then
+            nft add rule ip qfeeds input-chain ip s @${NFT_SET_NAME_V4} drop
+        fi
+    fi
+
+    if [ "$BLOCK_OUTGOING" = "yes" ]; then
+        if ! nft list chain ip qfeeds output-chain &>/dev/null; then
+            nft add chain ip qfeeds output-chain { type filter hook output priority 0\; policy accept\; }
+            LOG "Created IPv4 output-chain in qfeeds table."
+        fi
+        # Ensure whitelist-then-blacklist rules exist for output chain (IPv4)
+        if ! nft list chain ip qfeeds output-chain | grep -q "ip d @$NFT_WHITELIST_SET_NAME_V4 accept"; then
+            nft add rule ip qfeeds output-chain ip d @${NFT_WHITELIST_SET_NAME_V4} accept
+        fi
+        if ! nft list chain ip qfeeds output-chain | grep -q "ip d @$NFT_SET_NAME_V4 drop"; then
+            nft add rule ip qfeeds output-chain ip d @${NFT_SET_NAME_V4} drop
+        fi
+    fi
+
+    # Chains and rules for IPv6
+    if [ "$BLOCK_INCOMING" = "yes" ]; then
+        if ! nft list chain ip6 qfeeds input-chain &>/dev/null; then
+            nft add chain ip6 qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
+            LOG "Created IPv6 input-chain in qfeeds table."
+        fi
+        if ! nft list chain ip6 qfeeds input-chain | grep -q "ip6 s @$NFT_WHITELIST_SET_NAME_V6 accept"; then
+            nft add rule ip6 qfeeds input-chain ip6 s @${NFT_WHITELIST_SET_NAME_V6} accept
+        fi
+        if ! nft list chain ip6 qfeeds input-chain | grep -q "ip6 s @$NFT_SET_NAME_V6 drop"; then
+            nft add rule ip6 qfeeds input-chain ip6 s @${NFT_SET_NAME_V6} drop
+        fi
+    fi
+
+    if [ "$BLOCK_OUTGOING" = "yes" ]; then
+        if ! nft list chain ip6 qfeeds output-chain &>/dev/null; then
+            nft add chain ip6 qfeeds output-chain { type filter hook output priority 0\; policy accept\; }
+            LOG "Created IPv6 output-chain in qfeeds table."
+        fi
+        if ! nft list chain ip6 qfeeds output-chain | grep -q "ip6 d @$NFT_WHITELIST_SET_NAME_V6 accept"; then
+            nft add rule ip6 qfeeds output-chain ip6 d @${NFT_WHITELIST_SET_NAME_V6} accept
+        fi
+        if ! nft list chain ip6 qfeeds output-chain | grep -q "ip6 d @$NFT_SET_NAME_V6 drop"; then
+            nft add rule ip6 qfeeds output-chain ip6 d @${NFT_SET_NAME_V6} drop
+        fi
     fi
 }
 
@@ -284,6 +402,34 @@ update_nft_sets() {
     LOG "nft sets updated with the latest IPs."
 }
 
+update_whitelist_sets() {
+    LOG "Updating nft whitelist sets (if configured)."
+
+    # IPv4 whitelist
+    if [ -n "$WHITELIST_V4" ]; then
+        echo "$WHITELIST_V4" | tr ',' '\n' | while IFS= read -r ip; do
+            ip_trimmed=$(echo "$ip" | xargs)
+            [ -z "$ip_trimmed" ] && continue
+            nft add element ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { "$ip_trimmed" }
+        done
+        LOG "IPv4 whitelist set $NFT_WHITELIST_SET_NAME_V4 updated."
+    else
+        LOG "No IPv4 whitelist configured."
+    fi
+
+    # IPv6 whitelist
+    if [ -n "$WHITELIST_V6" ]; then
+        echo "$WHITELIST_V6" | tr ',' '\n' | while IFS= read -r ip; do
+            ip_trimmed=$(echo "$ip" | xargs)
+            [ -z "$ip_trimmed" ] && continue
+            nft add element ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { "$ip_trimmed" }
+        done
+        LOG "IPv6 whitelist set $NFT_WHITELIST_SET_NAME_V6 updated."
+    else
+        LOG "No IPv6 whitelist configured."
+    fi
+}
+
 save_nft_rules() {
     # Depending on your distro, netfilter-persistent might work with nft
     # or you can manually save to /etc/nftables.conf
@@ -316,6 +462,14 @@ source "$CONFIG_FILE"
 [ -z "$API_TOKEN" ] && { echo "Error: API_TOKEN is not set in the config file."; exit 1; }
 [ -z "$LOG_FILE" ] && LOG_FILE="/var/log/qfeeds_blocklist.log"
 
+# Default directional options if not set (backwards compatibility)
+[ -z "$BLOCK_INCOMING" ] && BLOCK_INCOMING="yes"
+[ -z "$BLOCK_OUTGOING" ] && BLOCK_OUTGOING="no"
+
+# Default whitelist set names if not set (backwards compatibility)
+[ -z "$NFT_WHITELIST_SET_NAME_V4" ] && NFT_WHITELIST_SET_NAME_V4="qfeeds_whitelist_v4"
+[ -z "$NFT_WHITELIST_SET_NAME_V6" ] && NFT_WHITELIST_SET_NAME_V6="qfeeds_whitelist_v6"
+
 # Construct API URL
 if [ -z "$LIMIT" ] || [ "$LIMIT" -le 0 ]; then
     API_URL="https://api.qfeeds.com/api?feed_type=${FEED_TYPE}&api_token=${API_TOKEN}"
@@ -331,6 +485,7 @@ setup_nft
 fetch_blocklist
 parse_ips
 update_nft_sets
+update_whitelist_sets
 save_nft_rules
 
 LOG "Q-Feeds nftables blocklist update completed successfully."
