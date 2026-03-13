@@ -71,14 +71,15 @@ FEED_TYPE="malware_ip"
 ### 3) Limit of IPs to Fetch (optional)
 
 - **Prompt**:  
-  `Enter the limit of IPs to fetch [default: 130000]:`
-- Default is `130000`.
-- This controls how many entries are pulled from the feed for performance/scale tuning.
+  `Enter the limit of IPs to fetch (leave empty for no limit):`
+- If you **press Enter**, no limit is applied (all entries from the feed are eligible to be pulled).
+- If you enter a number (for example `50000`), that value is used to cap how many entries are pulled from the feed.
 
 Stored as:
 
 ```bash
-LIMIT=130000
+LIMIT=50000         # if you entered 50000
+# or empty/omitted  # if you pressed Enter for "no limit"
 ```
 
 ### 4) Directional Blocking – Incoming / Outgoing

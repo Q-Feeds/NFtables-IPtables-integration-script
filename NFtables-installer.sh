@@ -119,8 +119,7 @@ configure_script() {
     read -rp "Enter feed type [default: malware_ip]: " FEED_TYPE
     FEED_TYPE=${FEED_TYPE:-malware_ip}
 
-    read -rp "Enter the limit of IPs to fetch [default: 130000]: " LIMIT
-    LIMIT=${LIMIT:-130000}
+    read -rp "Enter the limit of IPs to fetch (leave empty for no limit): " LIMIT
 
     # Directional blocking options
     read -rp "Block INCOMING connections from malicious IPs? [Y/n]: " BLOCK_INCOMING
