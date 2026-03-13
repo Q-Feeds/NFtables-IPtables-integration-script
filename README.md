@@ -4,7 +4,7 @@
 
 **Automated malware IP blocklist for Linux servers using nftables**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Linux](https://img.shields.io/badge/Linux-nftables-orange)](https://netfilter.org/projects/nftables/)
 
 </div>
@@ -363,7 +363,7 @@ The uninstaller removes everything:
 
 ## 📄 License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **Apache License 2.0** - see the [LICENSE](LICENSE) file for details.
 
 ---
 
