@@ -2,7 +2,7 @@
 # =============================================================================
 # Q-Feeds Blocklist Installer Script (nftables Edition)
 # =============================================================================
-# Copyright (c) 2024 Q-Feeds
+# Copyright (c) 2026 Q-Feeds
 # All rights reserved.
 #
 # This script installs and configures the Q-Feeds Blocklist on your system,
