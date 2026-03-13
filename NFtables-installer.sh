@@ -26,9 +26,6 @@ set -e
 CONFIG_FILE="/etc/qfeeds/qfeeds_config.conf"
 LOG_FILE="/var/log/qfeeds_blocklist.log"
 MAIN_SCRIPT="/usr/local/bin/update_qfeeds_blocklist.sh"
-INSTALLER_SCRIPT="/usr/local/bin/install_qfeeds.sh"
-LOCK_FILE="/var/lock/qfeeds_blocklist.lock"
-NFT_RESTORE_SERVICE="/etc/systemd/system/ipset-restore.service"  # Not really used now, but left for reference
 CRON_CMD="/usr/local/bin/update_qfeeds_blocklist.sh"
 
 # ================================
@@ -44,6 +41,10 @@ accept_terms() {
     echo
     echo "Please review the Terms & Conditions and EULA at the following URL:"
     echo "https://qfeeds.com/terms"
+    echo
+    echo "Running this script is your own responsibility. Q-Feeds is not responsible for any damage caused by this script."
+    echo
+    echo "================================================================================"
     echo
     read -rp "Do you accept the Terms & Conditions and EULA? (yes/no): " response
     case "$response" in
@@ -68,24 +69,48 @@ detect_distro() {
     fi
 }
 
+detect_firewall_backend() {
+    # This installer currently supports nftables only.
+    if command -v nft >/dev/null 2>&1; then
+        echo "Detected nftables support (nft command available)."
+    else
+        echo "Error: 'nft' command not found. This installer only supports nftables."
+        echo "If you need legacy iptables support, use the iptables/ipset variant of the Q-Feeds integration."
+        exit 1
+    fi
+
+    # Optional: inform user about iptables backend mode, if iptables is present
+    if command -v iptables >/dev/null 2>&1; then
+        if command -v update-alternatives >/dev/null 2>&1; then
+            if update-alternatives --query iptables 2>/dev/null | grep -q 'iptables-nft'; then
+                echo "Info: iptables is configured to use the nftables backend (iptables-nft)."
+            else
+                echo "Warning: iptables appears to be using the legacy backend."
+                echo "This script will still configure nftables directly; legacy iptables rules are not modified."
+            fi
+        fi
+    fi
+}
+
 install_dependencies() {
     echo "Installing required packages..."
     case "$DISTRO_ID" in
         ubuntu|debian)
             apt-get update
-            apt-get install -y nftables curl flock
+            # On Debian/Ubuntu, 'flock' is provided by 'util-linux', not a separate package
+            apt-get install -y nftables curl jq util-linux
             ;;
         centos|rhel|almalinux|rocky)
-            yum install -y nftables curl util-linux
+            yum install -y nftables curl util-linux jq
             ;;
         fedora)
-            dnf install -y nftables curl util-linux
+            dnf install -y nftables curl util-linux jq
             ;;
         opensuse-leap|sles)
-            zypper install -y nftables curl util-linux
+            zypper install -y nftables curl util-linux jq
             ;;
         arch)
-            pacman -Sy --noconfirm nftables curl util-linux
+            pacman -Sy --noconfirm nftables curl util-linux jq
             ;;
         *)
             echo "Unsupported Linux distribution: $DISTRO_ID"
@@ -179,9 +204,13 @@ WHITELIST_V6="$WHITELIST_V6"
 # Log File Location
 LOG_FILE="$LOG_FILE"
 
-# NFTables Set Names (blacklists)
+# NFTables Set Names (blacklists - hash sets for individual IPs)
 NFT_SET_NAME_V4="qfeeds_blacklist_v4"
 NFT_SET_NAME_V6="qfeeds_blacklist_v6"
+
+# NFTables Set Names (blacklists - interval sets for CIDRs)
+NFT_NET_SET_NAME_V4="qfeeds_blacklist_v4_nets"
+NFT_NET_SET_NAME_V6="qfeeds_blacklist_v6_nets"
 
 # NFTables Set Names (whitelists)
 NFT_WHITELIST_SET_NAME_V4="qfeeds_whitelist_v4"
@@ -214,7 +243,7 @@ LOG() {
 }
 
 cleanup() {
-    rm -f "$TEMP_IPS" "$TEMP_RESPONSE"
+    rm -f "$TEMP_IPV4" "$TEMP_IPV6" "$BATCH_FILE"
     LOG "Cleaned up temporary files."
 }
 
@@ -226,7 +255,7 @@ flock -n 200 || { LOG "Another instance is running. Exiting."; exit 1; }
 
 check_dependencies() {
     local missing=0
-    for cmd in nft curl flock; do
+    for cmd in nft curl flock jq; do
         if ! command -v "$cmd" &>/dev/null; then
             LOG "Error: Required command '$cmd' is not installed."
             missing=$((missing + 1))
@@ -238,60 +267,79 @@ check_dependencies() {
     fi
 }
 
+should_run_now() {
+    LICENSES_URL="https://api.qfeeds.com/licenses.php?api_token=${API_TOKEN}"
+    LOG "Checking license schedule at $LICENSES_URL"
+
+    local tmp_licenses
+    tmp_licenses=$(mktemp /tmp/qfeeds_licenses.XXXXXX)
+    local http_status
+    http_status=$(curl -s -w "%{http_code}" -m 60 -o "$tmp_licenses" "$LICENSES_URL")
+
+    if [ "$http_status" -ne 200 ]; then
+        LOG "Warning: licenses.php returned HTTP $http_status, proceeding with update anyway."
+        rm -f "$tmp_licenses"
+        return 0
+    fi
+
+    # Extract next_update for the configured FEED_TYPE
+    local next_update
+    next_update=$(jq -r --arg ft "$FEED_TYPE" '
+        .feeds[] | select(.feed_type == $ft and .licensed == true) | .next_update
+    ' "$tmp_licenses")
+
+    rm -f "$tmp_licenses"
+
+    if [ -z "$next_update" ] || [ "$next_update" = "null" ]; then
+        LOG "Warning: No next_update found for feed_type=$FEED_TYPE in licenses.php, proceeding."
+        return 0
+    fi
+
+    # Convert ISO8601 to epoch (UTC)
+    local now_epoch next_epoch
+    now_epoch=$(date -u +%s)
+    next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null || echo "")
+
+    if [ -z "$next_epoch" ]; then
+        LOG "Warning: Could not parse next_update='$next_update', proceeding."
+        return 0
+    fi
+
+    if [ "$now_epoch" -lt "$next_epoch" ]; then
+        LOG "Not time yet. Next update scheduled at $next_update (UTC). Skipping this run."
+        exit 0
+    fi
+
+    LOG "License schedule allows update (now >= $next_update). Continuing."
+}
+
 setup_nft() {
-    # Create tables and sets if they don't exist; otherwise, flush them.
+    # Two set types per family:
+    #   - Hash set (no interval) for individual IPs: O(1) lookup, fast bulk insert
+    #   - Interval set (with auto-merge) for CIDRs: small count, auto-merge is cheap
+    # Whitelist sets remain interval (small and repopulated from config each run).
 
-    # For IPv4
-    if nft list table ip qfeeds &>/dev/null; then
-        # Table exists, flush blacklist set or re-create
-        if nft list set ip qfeeds "$NFT_SET_NAME_V4" &>/dev/null; then
-            nft flush set ip qfeeds "$NFT_SET_NAME_V4"
-            LOG "Flushed existing nft blacklist set: $NFT_SET_NAME_V4"
-        else
-            nft add set ip qfeeds "$NFT_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-            LOG "Created nft blacklist set: $NFT_SET_NAME_V4"
-        fi
+    # IPv4 table and sets
+    nft add table ip qfeeds 2>/dev/null || true
+    nft list set ip qfeeds "$NFT_SET_NAME_V4" &>/dev/null || \
+        nft add set ip qfeeds "$NFT_SET_NAME_V4" { type ipv4_addr\; }
+    nft list set ip qfeeds "$NFT_NET_SET_NAME_V4" &>/dev/null || \
+        nft add set ip qfeeds "$NFT_NET_SET_NAME_V4" { type ipv4_addr\; flags interval\; auto-merge\; }
+    nft list set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" &>/dev/null || \
+        nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; auto-merge\; }
+    nft flush set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" 2>/dev/null || true
+    LOG "IPv4 table and sets ready."
 
-        # Whitelist set for IPv4
-        if nft list set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" &>/dev/null; then
-            nft flush set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4"
-            LOG "Flushed existing nft whitelist set: $NFT_WHITELIST_SET_NAME_V4"
-        else
-            nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-            LOG "Created nft whitelist set: $NFT_WHITELIST_SET_NAME_V4"
-        fi
-    else
-        nft add table ip qfeeds
-        nft add set ip qfeeds "$NFT_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-        nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; }
-        LOG "Created nft table qfeeds and IPv4 sets."
-    fi
-
-    # For IPv6
-    if nft list table ip6 qfeeds &>/dev/null; then
-        # Table exists, flush blacklist set or re-create
-        if nft list set ip6 qfeeds "$NFT_SET_NAME_V6" &>/dev/null; then
-            nft flush set ip6 qfeeds "$NFT_SET_NAME_V6"
-            LOG "Flushed existing nft blacklist set: $NFT_SET_NAME_V6"
-        else
-            nft add set ip6 qfeeds "$NFT_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-            LOG "Created nft blacklist set: $NFT_SET_NAME_V6"
-        fi
-
-        # Whitelist set for IPv6
-        if nft list set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" &>/dev/null; then
-            nft flush set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6"
-            LOG "Flushed existing nft whitelist set: $NFT_WHITELIST_SET_NAME_V6"
-        else
-            nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-            LOG "Created nft whitelist set: $NFT_WHITELIST_SET_NAME_V6"
-        fi
-    else
-        nft add table ip6 qfeeds
-        nft add set ip6 qfeeds "$NFT_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-        nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; }
-        LOG "Created nft ip6 qfeeds table and IPv6 sets."
-    fi
+    # IPv6 table and sets
+    nft add table ip6 qfeeds 2>/dev/null || true
+    nft list set ip6 qfeeds "$NFT_SET_NAME_V6" &>/dev/null || \
+        nft add set ip6 qfeeds "$NFT_SET_NAME_V6" { type ipv6_addr\; }
+    nft list set ip6 qfeeds "$NFT_NET_SET_NAME_V6" &>/dev/null || \
+        nft add set ip6 qfeeds "$NFT_NET_SET_NAME_V6" { type ipv6_addr\; flags interval\; auto-merge\; }
+    nft list set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" &>/dev/null || \
+        nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; auto-merge\; }
+    nft flush set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" 2>/dev/null || true
+    LOG "IPv6 table and sets ready."
 
     # Chains and rules for IPv4
     if [ "$BLOCK_INCOMING" = "yes" ]; then
@@ -299,13 +347,12 @@ setup_nft() {
             nft add chain ip qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
             LOG "Created IPv4 input-chain in qfeeds table."
         fi
-        # Ensure whitelist-then-blacklist rules exist for input chain (IPv4)
-        if ! nft list chain ip qfeeds input-chain | grep -q "ip s @$NFT_WHITELIST_SET_NAME_V4 accept"; then
-            nft add rule ip qfeeds input-chain ip s @${NFT_WHITELIST_SET_NAME_V4} accept
-        fi
-        if ! nft list chain ip qfeeds input-chain | grep -q "ip s @$NFT_SET_NAME_V4 drop"; then
-            nft add rule ip qfeeds input-chain ip s @${NFT_SET_NAME_V4} drop
-        fi
+        nft list chain ip qfeeds input-chain | grep -q "ip saddr @$NFT_WHITELIST_SET_NAME_V4 accept" || \
+            nft add rule ip qfeeds input-chain ip saddr @${NFT_WHITELIST_SET_NAME_V4} accept
+        nft list chain ip qfeeds input-chain | grep -q "ip saddr @$NFT_SET_NAME_V4 drop" || \
+            nft add rule ip qfeeds input-chain ip saddr @${NFT_SET_NAME_V4} drop
+        nft list chain ip qfeeds input-chain | grep -q "ip saddr @$NFT_NET_SET_NAME_V4 drop" || \
+            nft add rule ip qfeeds input-chain ip saddr @${NFT_NET_SET_NAME_V4} drop
     fi
 
     if [ "$BLOCK_OUTGOING" = "yes" ]; then
@@ -313,13 +360,12 @@ setup_nft() {
             nft add chain ip qfeeds output-chain { type filter hook output priority 0\; policy accept\; }
             LOG "Created IPv4 output-chain in qfeeds table."
         fi
-        # Ensure whitelist-then-blacklist rules exist for output chain (IPv4)
-        if ! nft list chain ip qfeeds output-chain | grep -q "ip d @$NFT_WHITELIST_SET_NAME_V4 accept"; then
-            nft add rule ip qfeeds output-chain ip d @${NFT_WHITELIST_SET_NAME_V4} accept
-        fi
-        if ! nft list chain ip qfeeds output-chain | grep -q "ip d @$NFT_SET_NAME_V4 drop"; then
-            nft add rule ip qfeeds output-chain ip d @${NFT_SET_NAME_V4} drop
-        fi
+        nft list chain ip qfeeds output-chain | grep -q "ip daddr @$NFT_WHITELIST_SET_NAME_V4 accept" || \
+            nft add rule ip qfeeds output-chain ip daddr @${NFT_WHITELIST_SET_NAME_V4} accept
+        nft list chain ip qfeeds output-chain | grep -q "ip daddr @$NFT_SET_NAME_V4 drop" || \
+            nft add rule ip qfeeds output-chain ip daddr @${NFT_SET_NAME_V4} drop
+        nft list chain ip qfeeds output-chain | grep -q "ip daddr @$NFT_NET_SET_NAME_V4 drop" || \
+            nft add rule ip qfeeds output-chain ip daddr @${NFT_NET_SET_NAME_V4} drop
     fi
 
     # Chains and rules for IPv6
@@ -328,12 +374,12 @@ setup_nft() {
             nft add chain ip6 qfeeds input-chain { type filter hook input priority 0\; policy accept\; }
             LOG "Created IPv6 input-chain in qfeeds table."
         fi
-        if ! nft list chain ip6 qfeeds input-chain | grep -q "ip6 s @$NFT_WHITELIST_SET_NAME_V6 accept"; then
-            nft add rule ip6 qfeeds input-chain ip6 s @${NFT_WHITELIST_SET_NAME_V6} accept
-        fi
-        if ! nft list chain ip6 qfeeds input-chain | grep -q "ip6 s @$NFT_SET_NAME_V6 drop"; then
-            nft add rule ip6 qfeeds input-chain ip6 s @${NFT_SET_NAME_V6} drop
-        fi
+        nft list chain ip6 qfeeds input-chain | grep -q "ip6 saddr @$NFT_WHITELIST_SET_NAME_V6 accept" || \
+            nft add rule ip6 qfeeds input-chain ip6 saddr @${NFT_WHITELIST_SET_NAME_V6} accept
+        nft list chain ip6 qfeeds input-chain | grep -q "ip6 saddr @$NFT_SET_NAME_V6 drop" || \
+            nft add rule ip6 qfeeds input-chain ip6 saddr @${NFT_SET_NAME_V6} drop
+        nft list chain ip6 qfeeds input-chain | grep -q "ip6 saddr @$NFT_NET_SET_NAME_V6 drop" || \
+            nft add rule ip6 qfeeds input-chain ip6 saddr @${NFT_NET_SET_NAME_V6} drop
     fi
 
     if [ "$BLOCK_OUTGOING" = "yes" ]; then
@@ -341,64 +387,302 @@ setup_nft() {
             nft add chain ip6 qfeeds output-chain { type filter hook output priority 0\; policy accept\; }
             LOG "Created IPv6 output-chain in qfeeds table."
         fi
-        if ! nft list chain ip6 qfeeds output-chain | grep -q "ip6 d @$NFT_WHITELIST_SET_NAME_V6 accept"; then
-            nft add rule ip6 qfeeds output-chain ip6 d @${NFT_WHITELIST_SET_NAME_V6} accept
-        fi
-        if ! nft list chain ip6 qfeeds output-chain | grep -q "ip6 d @$NFT_SET_NAME_V6 drop"; then
-            nft add rule ip6 qfeeds output-chain ip6 d @${NFT_SET_NAME_V6} drop
-        fi
+        nft list chain ip6 qfeeds output-chain | grep -q "ip6 daddr @$NFT_WHITELIST_SET_NAME_V6 accept" || \
+            nft add rule ip6 qfeeds output-chain ip6 daddr @${NFT_WHITELIST_SET_NAME_V6} accept
+        nft list chain ip6 qfeeds output-chain | grep -q "ip6 daddr @$NFT_SET_NAME_V6 drop" || \
+            nft add rule ip6 qfeeds output-chain ip6 daddr @${NFT_SET_NAME_V6} drop
+        nft list chain ip6 qfeeds output-chain | grep -q "ip6 daddr @$NFT_NET_SET_NAME_V6 drop" || \
+            nft add rule ip6 qfeeds output-chain ip6 daddr @${NFT_NET_SET_NAME_V6} drop
     fi
 }
 
-fetch_blocklist() {
-    LOG "Fetching blocklist from Q-Feeds..."
-    http_status=$(curl -s -w "%{http_code}" -m 300 -o "$TEMP_RESPONSE" "$API_URL")
+# ================================
+# Feed Fetching & Sync Functions
+# ================================
+
+fetch_feed() {
+    local url="$1"
+    local outfile="$2"
+    local desc="$3"
+    LOG "Fetching $desc..."
+    local http_status
+    http_status=$(curl -s -w "%{http_code}" -m 300 -o "$outfile" "$url")
     if [ "$http_status" -ne 200 ]; then
-        LOG "Error: Failed to fetch blocklist. HTTP status code: $http_status"
-        LOG "Response:"
-        cat "$TEMP_RESPONSE" | tee -a "$LOG_FILE"
-        exit 1
+        LOG "Error: Failed to fetch $desc. HTTP $http_status"
+        return 1
     fi
-    if [ ! -s "$TEMP_RESPONSE" ]; then
-        LOG "Error: Blocklist response is empty."
-        exit 1
+    if [ ! -s "$outfile" ]; then
+        LOG "Warning: $desc response is empty."
+        return 1
     fi
-    LOG "Successfully fetched blocklist."
+    local count
+    count=$(wc -l < "$outfile")
+    LOG "Fetched $desc: $count lines."
+    return 0
 }
 
-parse_ips() {
-    LOG "Parsing IP addresses from the response..."
-    cp "$TEMP_RESPONSE" "$TEMP_IPS"
-
-    # Validate that the file has at least something that looks like IP addresses
-    if ! grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$|:' "$TEMP_IPS"; then
-        LOG "Error: No valid IP addresses found in the response."
-        exit 1
+build_feed_url() {
+    local ipv6_param="$1"
+    local diff_param="$2"
+    local url="https://api.qfeeds.com/api?feed_type=${FEED_TYPE}&api_token=${API_TOKEN}&ipv6=${ipv6_param}"
+    if [ -n "$LIMIT" ] && [ "$LIMIT" -gt 0 ] 2>/dev/null; then
+        url="${url}&limit=${LIMIT}"
     fi
-
-    LOG "Parsed $(wc -l < "$TEMP_IPS") IP addresses (including potential invalid lines)."
+    if [ -n "$diff_param" ]; then
+        url="${url}&diff=${diff_param}"
+    fi
+    echo "$url"
 }
 
-update_nft_sets() {
-    LOG "Updating nft sets: $NFT_SET_NAME_V4 (IPv4) and $NFT_SET_NAME_V6 (IPv6)"
+batch_load_set() {
+    # Separates IPs and CIDRs into different nft commands:
+    #   - Individual IPs → hash set (ip_setname), 2000 per command
+    #   - CIDRs (contain /) → interval set (net_setname), 200 per command
+    local infile="$1"
+    local family="$2"
+    local ip_setname="$3"
+    local net_setname="$4"
 
-    # Add each IP to its respective set
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        [[ "$ip" =~ ^# ]] && continue
+    grep -v '^[[:space:]]*$' "$infile" | grep -v '^#' | sort -u | \
+    awk -v fam="$family" -v ipsn="$ip_setname" -v netsn="$net_setname" '
+    BEGIN { nip=0; ipbuf=""; nnet=0; netbuf="" }
+    {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+        if (length($0) == 0) next
+        if (index($0, "/") > 0) {
+            if (nnet > 0) netbuf = netbuf ", "
+            netbuf = netbuf $0
+            nnet++
+            if (nnet >= 200) {
+                print "add element " fam " qfeeds " netsn " { " netbuf " }"
+                nnet=0; netbuf=""
+            }
+        } else {
+            if (nip > 0) ipbuf = ipbuf ", "
+            ipbuf = ipbuf $0
+            nip++
+            if (nip >= 2000) {
+                print "add element " fam " qfeeds " ipsn " { " ipbuf " }"
+                nip=0; ipbuf=""
+            }
+        }
+    }
+    END {
+        if (nip > 0) print "add element " fam " qfeeds " ipsn " { " ipbuf " }"
+        if (nnet > 0) print "add element " fam " qfeeds " netsn " { " netbuf " }"
+    }
+    '
+}
 
-        # IPv4 check
-        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            nft add element ip qfeeds "$NFT_SET_NAME_V4" { "$ip" }
-        # IPv6 check
-        elif [[ "$ip" =~ : ]]; then
-            nft add element ip6 qfeeds "$NFT_SET_NAME_V6" { "$ip" }
-        else
-            LOG "Warning: Invalid IP format skipped - $ip"
+nft_batch_apply() {
+    local batchfile="$1"
+
+    # Fast path: try loading entire batch in one nft -f call
+    if nft -f "$batchfile" 2>>"$LOG_FILE"; then
+        return 0
+    fi
+
+    LOG "Batch nft -f failed. Falling back to per-command execution..."
+
+    # Fallback: execute each line as individual nft command (always works,
+    # avoids netlink buffer limits since each command is its own small message)
+    local total failed=0 count=0
+    total=$(wc -l < "$batchfile")
+    while IFS= read -r cmd; do
+        count=$((count + 1))
+        if ! nft "$cmd" 2>>"$LOG_FILE"; then
+            LOG "Error on command $count/$total: ${cmd:0:80}..."
+            failed=1
+            break
         fi
-    done < "$TEMP_IPS"
+        if [ $((count % 50)) -eq 0 ]; then
+            LOG "  Progress: $count/$total commands applied..."
+        fi
+    done < "$batchfile"
 
-    LOG "nft sets updated with the latest IPs."
+    return $failed
+}
+
+apply_full_sync() {
+    LOG "Starting full sync..."
+    local sync_ok=0
+
+    # Flush all blacklist sets (both hash and interval) before full reload
+    nft flush set ip qfeeds "$NFT_SET_NAME_V4" 2>/dev/null || true
+    nft flush set ip qfeeds "$NFT_NET_SET_NAME_V4" 2>/dev/null || true
+    nft flush set ip6 qfeeds "$NFT_SET_NAME_V6" 2>/dev/null || true
+    nft flush set ip6 qfeeds "$NFT_NET_SET_NAME_V6" 2>/dev/null || true
+    LOG "Flushed blacklist sets for full sync."
+
+    # Fetch IPv4 feed (ipv6=0)
+    local url_v4
+    url_v4=$(build_feed_url "0" "")
+    if fetch_feed "$url_v4" "$TEMP_IPV4" "IPv4 feed"; then
+        batch_load_set "$TEMP_IPV4" "ip" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4" > "$BATCH_FILE"
+        if [ -s "$BATCH_FILE" ]; then
+            local batch_lines
+            batch_lines=$(wc -l < "$BATCH_FILE")
+            LOG "Loading IPv4 blacklist: $batch_lines commands..."
+            if nft_batch_apply "$BATCH_FILE"; then
+                LOG "IPv4 blacklist loaded successfully."
+                sync_ok=1
+            else
+                LOG "Error: batch apply failed for IPv4 blacklist."
+            fi
+        fi
+        : > "$BATCH_FILE"
+    fi
+
+    # Fetch IPv6 feed (ipv6=only)
+    local url_v6
+    url_v6=$(build_feed_url "only" "")
+    if fetch_feed "$url_v6" "$TEMP_IPV6" "IPv6 feed"; then
+        batch_load_set "$TEMP_IPV6" "ip6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6" > "$BATCH_FILE"
+        if [ -s "$BATCH_FILE" ]; then
+            local batch_lines_v6
+            batch_lines_v6=$(wc -l < "$BATCH_FILE")
+            LOG "Loading IPv6 blacklist: $batch_lines_v6 commands..."
+            if nft_batch_apply "$BATCH_FILE"; then
+                LOG "IPv6 blacklist loaded successfully."
+                sync_ok=1
+            else
+                LOG "Error: batch apply failed for IPv6 blacklist."
+            fi
+        fi
+        : > "$BATCH_FILE"
+    fi
+
+    if [ "$sync_ok" -eq 1 ]; then
+        touch "$STATE_FILE"
+        LOG "Full sync completed."
+    else
+        LOG "Error: Full sync failed — no feeds were loaded. State file not updated."
+    fi
+}
+
+apply_diff_sync() {
+    LOG "Starting diff sync..."
+
+    local had_changes=0
+
+    # Fetch IPv4 diff
+    local url_v4
+    url_v4=$(build_feed_url "0" "yes")
+    if fetch_feed "$url_v4" "$TEMP_IPV4" "IPv4 diff"; then
+        awk -v fam="ip" -v ipsn="$NFT_SET_NAME_V4" -v netsn="$NFT_NET_SET_NAME_V4" '
+        BEGIN { nia=0;iab=""; nid=0;idb=""; nna=0;nab=""; nnd=0;ndb="" }
+        {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if (length($0)==0||substr($0,1,1)=="#") next
+            p=substr($0,1,1); r=substr($0,2); gsub(/^[[:space:]]+/,"",r)
+            cidr=(index(r,"/")>0)
+            if (p=="+") {
+                if (cidr) {
+                    if(nna>0) nab=nab", "; nab=nab r; nna++
+                    if(nna>=200){print "add element "fam" qfeeds "netsn" { "nab" }";nna=0;nab=""}
+                } else {
+                    if(nia>0) iab=iab", "; iab=iab r; nia++
+                    if(nia>=2000){print "add element "fam" qfeeds "ipsn" { "iab" }";nia=0;iab=""}
+                }
+            } else if (p=="-") {
+                if (cidr) {
+                    if(nnd>0) ndb=ndb", "; ndb=ndb r; nnd++
+                    if(nnd>=200){print "delete element "fam" qfeeds "netsn" { "ndb" }";nnd=0;ndb=""}
+                } else {
+                    if(nid>0) idb=idb", "; idb=idb r; nid++
+                    if(nid>=2000){print "delete element "fam" qfeeds "ipsn" { "idb" }";nid=0;idb=""}
+                }
+            }
+        }
+        END {
+            if(nia>0) print "add element "fam" qfeeds "ipsn" { "iab" }"
+            if(nid>0) print "delete element "fam" qfeeds "ipsn" { "idb" }"
+            if(nna>0) print "add element "fam" qfeeds "netsn" { "nab" }"
+            if(nnd>0) print "delete element "fam" qfeeds "netsn" { "ndb" }"
+        }
+        ' "$TEMP_IPV4" > "$BATCH_FILE"
+
+        if [ -s "$BATCH_FILE" ]; then
+            if nft_batch_apply "$BATCH_FILE"; then
+                LOG "IPv4 diff applied."
+                had_changes=1
+            else
+                LOG "Error: diff apply failed for IPv4. Falling back to full sync."
+                apply_full_sync
+                return
+            fi
+        else
+            LOG "IPv4 diff: no changes."
+        fi
+        : > "$BATCH_FILE"
+    else
+        LOG "IPv4 diff fetch failed. Falling back to full sync."
+        apply_full_sync
+        return
+    fi
+
+    # Fetch IPv6 diff
+    local url_v6
+    url_v6=$(build_feed_url "only" "yes")
+    if fetch_feed "$url_v6" "$TEMP_IPV6" "IPv6 diff"; then
+        awk -v fam="ip6" -v ipsn="$NFT_SET_NAME_V6" -v netsn="$NFT_NET_SET_NAME_V6" '
+        BEGIN { nia=0;iab=""; nid=0;idb=""; nna=0;nab=""; nnd=0;ndb="" }
+        {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if (length($0)==0||substr($0,1,1)=="#") next
+            p=substr($0,1,1); r=substr($0,2); gsub(/^[[:space:]]+/,"",r)
+            cidr=(index(r,"/")>0)
+            if (p=="+") {
+                if (cidr) {
+                    if(nna>0) nab=nab", "; nab=nab r; nna++
+                    if(nna>=200){print "add element "fam" qfeeds "netsn" { "nab" }";nna=0;nab=""}
+                } else {
+                    if(nia>0) iab=iab", "; iab=iab r; nia++
+                    if(nia>=2000){print "add element "fam" qfeeds "ipsn" { "iab" }";nia=0;iab=""}
+                }
+            } else if (p=="-") {
+                if (cidr) {
+                    if(nnd>0) ndb=ndb", "; ndb=ndb r; nnd++
+                    if(nnd>=200){print "delete element "fam" qfeeds "netsn" { "ndb" }";nnd=0;ndb=""}
+                } else {
+                    if(nid>0) idb=idb", "; idb=idb r; nid++
+                    if(nid>=2000){print "delete element "fam" qfeeds "ipsn" { "idb" }";nid=0;idb=""}
+                }
+            }
+        }
+        END {
+            if(nia>0) print "add element "fam" qfeeds "ipsn" { "iab" }"
+            if(nid>0) print "delete element "fam" qfeeds "ipsn" { "idb" }"
+            if(nna>0) print "add element "fam" qfeeds "netsn" { "nab" }"
+            if(nnd>0) print "delete element "fam" qfeeds "netsn" { "ndb" }"
+        }
+        ' "$TEMP_IPV6" > "$BATCH_FILE"
+
+        if [ -s "$BATCH_FILE" ]; then
+            if nft_batch_apply "$BATCH_FILE"; then
+                LOG "IPv6 diff applied."
+                had_changes=1
+            else
+                LOG "Error: diff apply failed for IPv6. Falling back to full sync."
+                apply_full_sync
+                return
+            fi
+        else
+            LOG "IPv6 diff: no changes."
+        fi
+        : > "$BATCH_FILE"
+    else
+        LOG "IPv6 diff fetch failed. Falling back to full sync."
+        apply_full_sync
+        return
+    fi
+
+    touch "$STATE_FILE"
+    if [ "$had_changes" -eq 1 ]; then
+        LOG "Diff sync completed with changes."
+    else
+        LOG "Diff sync completed (no changes in this cycle)."
+    fi
 }
 
 update_whitelist_sets() {
@@ -465,25 +749,46 @@ source "$CONFIG_FILE"
 [ -z "$BLOCK_INCOMING" ] && BLOCK_INCOMING="yes"
 [ -z "$BLOCK_OUTGOING" ] && BLOCK_OUTGOING="no"
 
-# Default whitelist set names if not set (backwards compatibility)
+# Default set names if not set (backwards compatibility)
+[ -z "$NFT_SET_NAME_V4" ] && NFT_SET_NAME_V4="qfeeds_blacklist_v4"
+[ -z "$NFT_SET_NAME_V6" ] && NFT_SET_NAME_V6="qfeeds_blacklist_v6"
+[ -z "$NFT_NET_SET_NAME_V4" ] && NFT_NET_SET_NAME_V4="qfeeds_blacklist_v4_nets"
+[ -z "$NFT_NET_SET_NAME_V6" ] && NFT_NET_SET_NAME_V6="qfeeds_blacklist_v6_nets"
 [ -z "$NFT_WHITELIST_SET_NAME_V4" ] && NFT_WHITELIST_SET_NAME_V4="qfeeds_whitelist_v4"
 [ -z "$NFT_WHITELIST_SET_NAME_V6" ] && NFT_WHITELIST_SET_NAME_V6="qfeeds_whitelist_v6"
 
-# Construct API URL
-if [ -z "$LIMIT" ] || [ "$LIMIT" -le 0 ]; then
-    API_URL="https://api.qfeeds.com/api?feed_type=${FEED_TYPE}&api_token=${API_TOKEN}"
-else
-    API_URL="https://api.qfeeds.com/api?feed_type=${FEED_TYPE}&api_token=${API_TOKEN}&limit=${LIMIT}"
-fi
+STATE_FILE="/etc/qfeeds/.last_sync"
 
-TEMP_IPS=$(mktemp /tmp/qfeeds_ips.XXXXXX)
-TEMP_RESPONSE=$(mktemp /tmp/qfeeds_response.XXXXXX)
+TEMP_IPV4=$(mktemp /tmp/qfeeds_ipv4.XXXXXX)
+TEMP_IPV6=$(mktemp /tmp/qfeeds_ipv6.XXXXXX)
+BATCH_FILE=$(mktemp /tmp/qfeeds_nft_batch.XXXXXX)
 
 check_dependencies
 setup_nft
-fetch_blocklist
-parse_ips
-update_nft_sets
+
+if [ "$QFEEDS_FORCE_UPDATE" = "1" ]; then
+    LOG "Force update requested (QFEEDS_FORCE_UPDATE=1). Skipping license schedule check."
+else
+    should_run_now
+fi
+
+# Determine sync mode: full on first run / force, diff for subsequent runs (malware_ip only)
+if [ "$QFEEDS_FORCE_UPDATE" = "1" ] || [ ! -f "$STATE_FILE" ]; then
+    SYNC_MODE="full"
+elif [ "$FEED_TYPE" = "malware_ip" ]; then
+    SYNC_MODE="diff"
+else
+    SYNC_MODE="full"
+fi
+
+LOG "Sync mode: $SYNC_MODE"
+
+if [ "$SYNC_MODE" = "diff" ]; then
+    apply_diff_sync
+else
+    apply_full_sync
+fi
+
 update_whitelist_sets
 save_nft_rules
 
@@ -510,7 +815,7 @@ setup_cron() {
 
 finalize_installation() {
     echo "Finalizing installation..."
-    /usr/local/bin/update_qfeeds_blocklist.sh
+    QFEEDS_FORCE_UPDATE=1 "$MAIN_SCRIPT"
     echo "Installation and initial run completed."
 }
 
@@ -528,6 +833,7 @@ accept_terms
 detect_distro
 echo "Detected Linux distribution: $DISTRO_ID $DISTRO_VERSION"
 
+detect_firewall_backend
 install_dependencies
 configure_script
 install_main_script
@@ -536,4 +842,3 @@ finalize_installation
 
 echo "Q-Feeds Blocklist setup with nftables is complete!"
 exit 0
-m

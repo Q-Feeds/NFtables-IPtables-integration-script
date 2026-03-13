@@ -48,44 +48,22 @@ echo "Cron job removed."
 # -----------------------------------------------------------------------------
 echo "Removing nftables rules..."
 
+# Deleting the entire table removes all chains, rules, and sets atomically.
+# This avoids "Device or resource busy" errors from trying to delete sets
+# that are still referenced by rules.
+
 # IPv4 side
 if nft list table ip qfeeds &>/dev/null; then
-    # Remove the set if it exists
-    if nft list set ip qfeeds "$NFT_SET_NAME_V4" &>/dev/null; then
-        nft delete set ip qfeeds "$NFT_SET_NAME_V4"
-        echo "Deleted IPv4 nft set: $NFT_SET_NAME_V4"
-    fi
-
-    # Remove the chain if it exists
-    if nft list chain ip qfeeds input-chain &>/dev/null; then
-        nft delete chain ip qfeeds input-chain
-        echo "Deleted IPv4 chain 'input-chain' from table 'qfeeds'."
-    fi
-
-    # Finally remove the table itself
     nft delete table ip qfeeds
-    echo "Deleted IPv4 table 'qfeeds'."
+    echo "Deleted IPv4 table 'qfeeds' (including all chains, rules, and sets)."
 else
     echo "No IPv4 nftable 'qfeeds' found."
 fi
 
 # IPv6 side
 if nft list table ip6 qfeeds &>/dev/null; then
-    # Remove the set if it exists
-    if nft list set ip6 qfeeds "$NFT_SET_NAME_V6" &>/dev/null; then
-        nft delete set ip6 qfeeds "$NFT_SET_NAME_V6"
-        echo "Deleted IPv6 nft set: $NFT_SET_NAME_V6"
-    fi
-
-    # Remove the chain if it exists
-    if nft list chain ip6 qfeeds input-chain &>/dev/null; then
-        nft delete chain ip6 qfeeds input-chain
-        echo "Deleted IPv6 chain 'input-chain' from table 'qfeeds'."
-    fi
-
-    # Finally remove the table
     nft delete table ip6 qfeeds
-    echo "Deleted IPv6 table 'qfeeds'."
+    echo "Deleted IPv6 table 'qfeeds' (including all chains, rules, and sets)."
 else
     echo "No IPv6 nftable 'qfeeds' found."
 fi
@@ -110,7 +88,7 @@ fi
 # -----------------------------------------------------------------------------
 # Remove configuration files
 # -----------------------------------------------------------------------------
-echo "Removing configuration files..."
+echo "Removing configuration and state files..."
 if [ -f "$CONFIG_FILE" ]; then
     rm -f "$CONFIG_FILE"
     echo "Configuration file removed."
@@ -118,8 +96,10 @@ else
     echo "Configuration file not found."
 fi
 
+rm -f "/etc/qfeeds/.last_sync" 2>/dev/null
+
 if [ -d "/etc/qfeeds" ]; then
-    rmdir "/etc/qfeeds" 2>/dev/null || true
+    rm -rf "/etc/qfeeds"
     echo "Configuration directory removed."
 fi
 
@@ -135,12 +115,13 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Remove lock file
+# Remove lock file and leftover temp files
 # -----------------------------------------------------------------------------
 if [ -f "/var/lock/qfeeds_blocklist.lock" ]; then
     rm -f "/var/lock/qfeeds_blocklist.lock"
     echo "Lock file removed."
 fi
+rm -f /tmp/qfeeds_* 2>/dev/null || true
 
 echo "Q-Feeds Blocklist has been successfully uninstalled (nftables)."
 exit 0
