@@ -1,11 +1,11 @@
 <div align="center">
 
-# 🛡️ Q-Feeds NFtables Blocklist Integration
+# 🛡️ Q-Feeds Linux Firewall Blocklist Integration
 
-**Automated malware IP blocklist for Linux servers using nftables**
+**Automated malware IP blocklist for Linux servers — supports nftables and iptables+ipset**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Linux](https://img.shields.io/badge/Linux-nftables-orange)](https://netfilter.org/projects/nftables/)
+[![Linux](https://img.shields.io/badge/Linux-nftables%20%7C%20iptables-orange)](https://netfilter.org/)
 
 </div>
 
@@ -37,30 +37,30 @@ Obtain a free API key at [tip.qfeeds.com](https://tip.qfeeds.com/).
 ```bash
 git clone https://github.com/Q-Feeds/NFtables-IPtables-integration-script.git
 cd NFtables-IPtables-integration-script
-chmod +x NFtables-installer.sh NFtables-uninstaller.sh
+chmod +x qfeeds-installer.sh qfeeds-uninstaller.sh
 ```
 
 ### Step 3: Run the installer as root
 
 ```bash
-sudo ./NFtables-installer.sh
+sudo ./qfeeds-installer.sh
 ```
 
-The installer will prompt you for your API token, blocking options, and optional whitelist.
+The installer will:
+1. **Auto-detect** your firewall backend (nftables or iptables)
+2. Prompt you for your API token, blocking options, and optional whitelist
+3. Install all dependencies, the updater script, and cron job
+4. Perform the first full sync immediately
 
 ### Step 4: Done
 
-The installer automatically:
-- Creates the configuration at `/etc/qfeeds/qfeeds_config.conf`
-- Installs the updater script at `/usr/local/bin/update_qfeeds_blocklist.sh`
-- Sets up a cron job (default: every 20 minutes)
-- Runs an initial full sync to load the blocklist immediately
+Your server is now protected. The cron job checks for updates every 20 minutes (configurable), and actual API calls only happen when your license allows.
 
 ---
 
 ## 📖 Overview
 
-This solution periodically downloads the latest threat intelligence feed from Q-Feeds and applies it as nftables firewall rules, allowing you to:
+This solution periodically downloads the latest threat intelligence feed from Q-Feeds and applies it as firewall rules, allowing you to:
 
 - ✅ **Block incoming connections** from known malicious IPs
 - ✅ **Block outgoing connections** to known malicious IPs
@@ -70,19 +70,34 @@ This solution periodically downloads the latest threat intelligence feed from Q-
 
 ### Why This Approach?
 
-- ✅ **Fast**: Loads 400k+ IPs in ~10 seconds using optimized hash sets
-- ✅ **Safe**: Dedicated `qfeeds` table — never touches your existing firewall rules
-- ✅ **Efficient**: Diff-based updates only process changes, not the full list
-- ✅ **Reliable**: Automatic fallback to full sync if a diff fails
-- ✅ **Flexible**: Choose incoming/outgoing blocking, optional whitelist
+- ✅ **Auto-detects backend** — works on nftables or iptables+ipset without manual selection
+- ✅ **Fast** — loads 400k+ IPs in seconds using optimized hash sets (nftables) or ipset (iptables)
+- ✅ **Safe** — uses dedicated tables/sets — never touches your existing firewall rules
+- ✅ **Efficient** — diff-based updates only process changes, not the full list
+- ✅ **Reliable** — automatic fallback to full sync if a diff fails
+- ✅ **Flexible** — choose incoming/outgoing blocking, optional whitelist
 
 ---
 
 ## 🔧 How It Works
 
+### Backend Detection
+
+The installer automatically detects which firewall backend is available:
+
+| Priority | Detection | Backend |
+|----------|-----------|---------|
+| 1st | `nft` command found | **nftables** |
+| 2nd | `iptables` command found | **iptables+ipset** |
+| — | Neither found | Error (exit) |
+
+The detected backend is stored in the configuration file. The updater and uninstaller scripts use it to run the correct firewall commands.
+
 ### Architecture: Two Set Types
 
-The script uses a split-set architecture for maximum performance:
+Both backends use the same split-set strategy for maximum performance:
+
+**nftables backend:**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -115,12 +130,39 @@ The script uses a split-set architecture for maximum performance:
 └─────────────────────────────────────────────────────────┘
 ```
 
-The same structure exists for IPv6 under `table ip6 qfeeds`.
+**iptables+ipset backend:**
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  ipset sets                                              │
+│                                                          │
+│  ┌─────────────────────────┐  ┌────────────────────────┐ │
+│  │ qfeeds_blacklist_v4     │  │ qfeeds_blacklist_v4    │ │
+│  │ (hash:ip)               │  │ _nets (hash:net)       │ │
+│  │ maxelem 1000000         │  │ maxelem 65536          │ │
+│  │                         │  │                        │ │
+│  │ Individual IPs          │  │ CIDR ranges            │ │
+│  └─────────────────────────┘  └────────────────────────┘ │
+│                                                          │
+│  ┌─────────────────────────┐                             │
+│  │ qfeeds_whitelist_v4     │                             │
+│  │ (hash:net)              │                             │
+│  └─────────────────────────┘                             │
+│                                                          │
+│  iptables rules (tagged with -m comment "qfeeds"):       │
+│    INPUT  -m set --match-set whitelist_v4 src -j ACCEPT  │
+│    INPUT  -m set --match-set blacklist_v4 src -j DROP    │
+│    INPUT  -m set --match-set blacklist_v4_nets src -j DROP│
+│    OUTPUT (if enabled) — same pattern with dst            │
+└──────────────────────────────────────────────────────────┘
+```
+
+The same structure exists for IPv6 (`ip6 qfeeds` table or `ip6tables` + `family inet6` ipsets).
 
 **Why two set types?**
 - **Hash sets** store individual IPs with O(1) insert and lookup — loading 400k+ IPs takes seconds
-- **Interval sets** (with `auto-merge`) are only used for the small number of CIDR ranges in the feed
-- This avoids the expensive merge operations that would slow down a single interval set with hundreds of thousands of entries
+- **Net/interval sets** are only used for the small number of CIDR ranges in the feed
+- This avoids expensive merge operations that would slow down a single set with hundreds of thousands of entries
 
 ### Update Flow
 
@@ -132,10 +174,10 @@ The same structure exists for IPv6 under `table ip6 qfeeds`.
 │  3. Fetch IPv4 feed (ipv6=0) and IPv6 feed           │
 │     (ipv6=only) separately                           │
 │  4. Separate IPs from CIDRs in awk                   │
-│  5. Batch-load into hash set (IPs) and interval      │
+│  5. Batch-load into hash set (IPs) and net/interval  │
 │     set (CIDRs)                                      │
 │  6. Update whitelist sets from config                 │
-│  7. Persist rules (netfilter-persistent or manual)    │
+│  7. Persist rules                                    │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -158,12 +200,14 @@ The updater checks the Q-Feeds license API (`licenses.php`) before every run. If
 
 Before installing, ensure you have:
 
-- [x] **Linux server** with `nftables` installed (Debian, Ubuntu, CentOS, Fedora, Arch, Alpine)
+- [x] **Linux server** with **nftables** or **iptables** (Debian, Ubuntu, CentOS, Fedora, Arch, Alpine)
 - [x] **Root access** — the installer and updater must run as root
 - [x] **Q-Feeds API Token** — get yours free at [tip.qfeeds.com](https://tip.qfeeds.com/)
 - [x] **Internet access** — the server needs to reach `api.qfeeds.com`
 
-The installer will automatically install required dependencies (`curl`, `jq`, `util-linux` for `flock`).
+The installer will automatically install required dependencies:
+- **nftables backend**: `nftables`, `curl`, `jq`, `util-linux`
+- **iptables backend**: `iptables`, `ipset`, `curl`, `jq`, `util-linux`
 
 ---
 
@@ -178,8 +222,8 @@ Visit [tip.qfeeds.com](https://tip.qfeeds.com/) to obtain your free Q-Feeds API 
 ```bash
 git clone https://github.com/Q-Feeds/NFtables-IPtables-integration-script.git
 cd NFtables-IPtables-integration-script
-chmod +x NFtables-installer.sh NFtables-uninstaller.sh
-sudo ./NFtables-installer.sh
+chmod +x qfeeds-installer.sh qfeeds-uninstaller.sh
+sudo ./qfeeds-installer.sh
 ```
 
 ### 3. Installer Prompts
@@ -248,6 +292,7 @@ All settings are stored in `/etc/qfeeds/qfeeds_config.conf`. You can edit this f
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `BACKEND` | Firewall backend (`nftables` or `iptables`) | *(auto-detected)* |
 | `API_TOKEN` | Your Q-Feeds API token | *(required)* |
 | `FEED_TYPE` | Feed type to fetch | `malware_ip` |
 | `LIMIT` | Max IPs to fetch (empty = no limit) | *(empty)* |
@@ -270,7 +315,7 @@ All settings are stored in `/etc/qfeeds/qfeeds_config.conf`. You can edit this f
 
 ## 🎯 Usage and Verification
 
-### Check if the blocklist is loaded
+### nftables backend
 
 ```bash
 # Show the table structure and rules
@@ -286,29 +331,39 @@ nft list set ip qfeeds qfeeds_blacklist_v4_nets | head -20
 nft list set ip6 qfeeds qfeeds_blacklist_v6 | wc -l
 ```
 
-### Check the log
+### iptables+ipset backend
 
 ```bash
-# Last 20 log entries
+# List all Q-Feeds ipsets and their sizes
+ipset list -t | grep -A4 qfeeds
+
+# Count loaded IPv4 IPs
+ipset list qfeeds_blacklist_v4 | tail -n +9 | wc -l
+
+# Show loaded CIDR ranges
+ipset list qfeeds_blacklist_v4_nets | tail -n +9 | head -20
+
+# Show iptables rules with qfeeds comment
+iptables -L INPUT -n --line-numbers | grep qfeeds
+ip6tables -L INPUT -n --line-numbers | grep qfeeds
+```
+
+### Common commands (both backends)
+
+```bash
+# Check the log (last 20 entries)
 tail -20 /var/log/qfeeds_blocklist.log
 
 # Check for errors
 grep -i "error" /var/log/qfeeds_blocklist.log
-```
 
-### Manually trigger an update
-
-```bash
 # Normal run (respects license schedule)
 sudo /usr/local/bin/update_qfeeds_blocklist.sh
 
 # Force a full sync (ignores schedule, reloads everything)
 sudo QFEEDS_FORCE_UPDATE=1 /usr/local/bin/update_qfeeds_blocklist.sh
-```
 
-### Verify cron is set up
-
-```bash
+# Verify cron is set up
 sudo crontab -l | grep qfeeds
 ```
 
@@ -316,11 +371,10 @@ sudo crontab -l | grep qfeeds
 
 ## 🔍 Troubleshooting
 
-**Installation fails with "Unable to locate package"**
-- The installer auto-detects your distro (Debian/Ubuntu, CentOS/RHEL, Fedora, Arch, Alpine). If detection fails, install dependencies manually: `curl`, `jq`, `util-linux` (for `flock`).
+### General
 
-**"Batch nft -f failed. Falling back to per-command execution..."**
-- This is normal, especially on LXC containers where the kernel's netlink buffer (`wmem_max`) is restricted. The per-command fallback works correctly and is fast (~10 seconds for 400k+ IPs).
+**Installation fails with "Unable to locate package"**
+- The installer auto-detects your distro (Debian/Ubuntu, CentOS/RHEL, Fedora, Arch, Alpine). If detection fails, install dependencies manually: `curl`, `jq`, `util-linux` (for `flock`), plus `nftables` or `iptables`+`ipset`.
 
 **Sets are empty after installation**
 - Check the log: `tail -50 /var/log/qfeeds_blocklist.log`
@@ -330,34 +384,63 @@ sudo crontab -l | grep qfeeds
 **"Not time yet. Next update scheduled at..."**
 - The updater respects your license schedule. This message means the cron ran, but your license doesn't allow an update yet. This is normal — the next cron run will check again.
 
+**Rules don't persist after reboot**
+- If `netfilter-persistent` is installed, rules are saved automatically
+- **nftables**: manually save with `nft list ruleset > /etc/nftables.conf`
+- **iptables**: manually save with `iptables-save > /etc/iptables.rules` and `ipset save > /etc/ipset.conf`
+- The cron job will also reload the rules on the next run
+
+### nftables-specific
+
+**"Batch nft -f failed. Falling back to per-command execution..."**
+- This is normal, especially on LXC containers where the kernel's netlink buffer (`wmem_max`) is restricted. The per-command fallback works correctly and is fast (~10 seconds for 400k+ IPs).
+
 **Syntax error: "unexpected string"**
 - Ensure you're running a recent version of nftables. The script uses `ip saddr`/`ip daddr` syntax which requires nftables 0.9+.
 
 **"Error: Could not process rule: Message too long"**
 - This is the netlink buffer limit, typically in LXC containers. The script automatically falls back to per-command execution. If you see this in the log alongside a successful load, it's working as intended.
 
-**Rules don't persist after reboot**
-- If `netfilter-persistent` is installed, rules are saved automatically. Otherwise, save manually:
-  ```bash
-  nft list ruleset > /etc/nftables.conf
-  ```
-- The cron job will also reload the rules on the next run.
+### iptables+ipset-specific
+
+**"ipset restore failed"**
+- Check that `ipset` is installed: `command -v ipset`
+- Check the log for specific errors: `grep -i "error" /var/log/qfeeds_blocklist.log`
+- Ensure the ipset module is loaded: `lsmod | grep ip_set`
+
+**iptables rules not showing up**
+- Verify rules with: `iptables -L INPUT -n | grep qfeeds`
+- The rules use `-m comment --comment "qfeeds"` for identification
+- Ensure the `xt_set` module is loaded: `modprobe xt_set`
+
+**"ipset create ... failed"**
+- On very old kernels, `hash:ip` or `hash:net` types may not be available. Upgrade your kernel or install `ipset` from a newer repository.
 
 ---
 
 ## 🗑️ Uninstalling
 
 ```bash
-sudo ./NFtables-uninstaller.sh
+sudo ./qfeeds-uninstaller.sh
 ```
 
-The uninstaller removes everything:
-- nftables tables (`ip qfeeds`, `ip6 qfeeds`) and all their sets, chains, and rules
+The uninstaller removes everything based on the detected backend:
+
+**nftables backend:**
+- Deletes `ip qfeeds` and `ip6 qfeeds` tables (including all chains, rules, and sets)
+
+**iptables backend:**
+- Removes all iptables/ip6tables rules tagged with the `qfeeds` comment
+- Destroys all ipset sets (`qfeeds_blacklist_v4`, `qfeeds_blacklist_v4_nets`, `qfeeds_whitelist_v4`, and IPv6 equivalents)
+
+**Both backends:**
 - Configuration directory (`/etc/qfeeds/`)
 - Updater script (`/usr/local/bin/update_qfeeds_blocklist.sh`)
 - Cron job, log file, and lock file
 
-> **Note:** The uninstaller does **not** remove system packages (curl, jq, etc.) that were installed as dependencies.
+If the config file is missing, the uninstaller tries cleanup for **both** backends.
+
+> **Note:** The uninstaller does **not** remove system packages (curl, jq, ipset, etc.) that were installed as dependencies.
 
 ---
 
