@@ -334,7 +334,6 @@ setup_nft() {
         nft add set ip qfeeds "$NFT_NET_SET_NAME_V4" { type ipv4_addr\; flags interval\; auto-merge\; }
     nft list set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" &>/dev/null || \
         nft add set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" { type ipv4_addr\; flags interval\; auto-merge\; }
-    nft flush set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" 2>/dev/null || true
     LOG "IPv4 table and sets ready."
 
     nft add table ip6 qfeeds 2>/dev/null || true
@@ -344,7 +343,6 @@ setup_nft() {
         nft add set ip6 qfeeds "$NFT_NET_SET_NAME_V6" { type ipv6_addr\; flags interval\; auto-merge\; }
     nft list set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" &>/dev/null || \
         nft add set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" { type ipv6_addr\; flags interval\; auto-merge\; }
-    nft flush set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" 2>/dev/null || true
     LOG "IPv6 table and sets ready."
 
     if [ "$BLOCK_INCOMING" = "yes" ]; then
@@ -405,13 +403,11 @@ setup_iptables() {
     ipset create "$NFT_SET_NAME_V4" hash:ip hashsize 131072 maxelem 1000000 -exist
     ipset create "$NFT_NET_SET_NAME_V4" hash:net maxelem 65536 -exist
     ipset create "$NFT_WHITELIST_SET_NAME_V4" hash:net maxelem 65536 -exist
-    ipset flush "$NFT_WHITELIST_SET_NAME_V4" 2>/dev/null || true
     LOG "IPv4 ipsets ready."
 
     ipset create "$NFT_SET_NAME_V6" hash:ip family inet6 hashsize 16384 maxelem 200000 -exist
     ipset create "$NFT_NET_SET_NAME_V6" hash:net family inet6 maxelem 65536 -exist
     ipset create "$NFT_WHITELIST_SET_NAME_V6" hash:net family inet6 maxelem 65536 -exist
-    ipset flush "$NFT_WHITELIST_SET_NAME_V6" 2>/dev/null || true
     LOG "IPv6 ipsets ready."
 
     # Helper: insert iptables rule if not already present (idempotent via -C check)
@@ -761,6 +757,14 @@ apply_diff_sync() {
 
 update_whitelist_sets() {
     LOG "Updating whitelist sets (if configured)."
+
+    if [ "$BACKEND" = "nftables" ]; then
+        nft flush set ip qfeeds "$NFT_WHITELIST_SET_NAME_V4" 2>/dev/null || true
+        nft flush set ip6 qfeeds "$NFT_WHITELIST_SET_NAME_V6" 2>/dev/null || true
+    else
+        ipset flush "$NFT_WHITELIST_SET_NAME_V4" 2>/dev/null || true
+        ipset flush "$NFT_WHITELIST_SET_NAME_V6" 2>/dev/null || true
+    fi
 
     if [ -n "$WHITELIST_V4" ]; then
         echo "$WHITELIST_V4" | tr ',' '\n' | while IFS= read -r ip; do
