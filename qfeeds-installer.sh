@@ -903,9 +903,26 @@ setup_cron() {
     read -rp "Enter cron schedule (e.g., '*/20 * * * *') [default: */20 * * * *]: " CRON_SCHEDULE
     CRON_SCHEDULE=${CRON_SCHEDULE:-"*/20 * * * *"}
 
-    # Remove any existing lines for this script, then add
-    (crontab -l 2>/dev/null | grep -v "$CRON_CMD"; echo "$CRON_SCHEDULE $CRON_CMD") | crontab -
-    echo "Cron job added (runs $CRON_CMD on schedule '$CRON_SCHEDULE')."
+    # Remove any existing lines for this script, then add one fresh entry.
+    # Use awk instead of grep -v because grep returns exit code 1 when no lines
+    # are selected, which interacts badly with "set -e" in this installer.
+    local existing_crontab
+    existing_crontab="$(crontab -l 2>/dev/null || true)"
+
+    {
+        printf '%s\n' "$existing_crontab" | awk -v cmd="$CRON_CMD" '
+            index($0, cmd) == 0 { print }
+        '
+        echo "$CRON_SCHEDULE $CRON_CMD"
+    } | crontab -
+
+    # Verify cron entry was written; fail loudly if not.
+    if crontab -l 2>/dev/null | grep -Fq "$CRON_CMD"; then
+        echo "Cron job added (runs $CRON_CMD on schedule '$CRON_SCHEDULE')."
+    else
+        echo "Error: Failed to save cron job for $CRON_CMD."
+        exit 1
+    fi
 }
 
 finalize_installation() {
