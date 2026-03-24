@@ -281,49 +281,69 @@ check_dependencies() {
 }
 
 should_run_now() {
-    LICENSES_URL="https://api.qfeeds.com/licenses.php?api_token=${API_TOKEN}"
-    LOG "Checking license schedule at $LICENSES_URL"
+    LOG "Checking cached license schedule at $LICENSE_CACHE_FILE"
 
-    local tmp_licenses
-    tmp_licenses=$(mktemp /tmp/qfeeds_licenses.XXXXXX)
-    local http_status
-    http_status=$(curl -s -w "%{http_code}" -m 60 -o "$tmp_licenses" "$LICENSES_URL")
-
-    if [ "$http_status" -ne 200 ]; then
-        LOG "Warning: licenses.php returned HTTP $http_status, proceeding with update anyway."
-        rm -f "$tmp_licenses"
-        return 0
+    if [ ! -f "$LICENSE_CACHE_FILE" ]; then
+        LOG "No cached license index found. Downloading initial licenses.php response."
+        if ! refresh_license_cache; then
+            LOG "Warning: Could not initialize license cache, proceeding with update anyway."
+            return 0
+        fi
     fi
 
-    # Extract next_update for the configured FEED_TYPE
+    # Extract next_update for the configured FEED_TYPE from the cached index.
     local next_update
     next_update=$(jq -r --arg ft "$FEED_TYPE" '
         .feeds[] | select(.feed_type == $ft and .licensed == true) | .next_update
-    ' "$tmp_licenses")
-
-    rm -f "$tmp_licenses"
+    ' "$LICENSE_CACHE_FILE")
 
     if [ -z "$next_update" ] || [ "$next_update" = "null" ]; then
-        LOG "Warning: No next_update found for feed_type=$FEED_TYPE in licenses.php, proceeding."
+        LOG "Warning: No cached next_update found for feed_type=$FEED_TYPE, proceeding."
         return 0
     fi
 
-    # Convert ISO8601 to epoch (UTC)
     local now_epoch next_epoch
     now_epoch=$(date -u +%s)
     next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null || echo "")
 
     if [ -z "$next_epoch" ]; then
-        LOG "Warning: Could not parse next_update='$next_update', proceeding."
+        LOG "Warning: Could not parse cached next_update='$next_update', refreshing cache and proceeding."
+        rm -f "$LICENSE_CACHE_FILE"
         return 0
     fi
 
     if [ "$now_epoch" -lt "$next_epoch" ]; then
-        LOG "Not time yet. Next update scheduled at $next_update (UTC). Skipping this run."
+        LOG "Not time yet. Cached next update scheduled at $next_update (UTC). Skipping this run."
         exit 0
     fi
 
-    LOG "License schedule allows update (now >= $next_update). Continuing."
+    LOG "Cached license schedule allows update (now >= $next_update). Continuing."
+}
+
+refresh_license_cache() {
+    LICENSES_URL="https://api.qfeeds.com/licenses.php?api_token=${API_TOKEN}"
+    LOG "Refreshing license cache from $LICENSES_URL"
+
+    local tmp_licenses http_status
+    tmp_licenses=$(mktemp /tmp/qfeeds_licenses.XXXXXX)
+    http_status=$(curl -s -w "%{http_code}" -m 60 -o "$tmp_licenses" "$LICENSES_URL")
+
+    if [ "$http_status" -ne 200 ]; then
+        LOG "Warning: licenses.php returned HTTP $http_status, keeping existing cached schedule."
+        rm -f "$tmp_licenses"
+        return 1
+    fi
+
+    if ! jq -e '.feeds' "$tmp_licenses" >/dev/null 2>&1; then
+        LOG "Warning: licenses.php returned invalid JSON, keeping existing cached schedule."
+        rm -f "$tmp_licenses"
+        return 1
+    fi
+
+    mv "$tmp_licenses" "$LICENSE_CACHE_FILE"
+    chmod 600 "$LICENSE_CACHE_FILE" 2>/dev/null || true
+    LOG "License cache refreshed."
+    return 0
 }
 
 setup_nft() {
@@ -457,6 +477,7 @@ fetch_feed() {
     local url="$1"
     local outfile="$2"
     local desc="$3"
+    local allow_empty="${4:-0}"
     LOG "Fetching $desc..."
     local http_status
     http_status=$(curl -s -w "%{http_code}" -m 300 -o "$outfile" "$url")
@@ -466,6 +487,11 @@ fetch_feed() {
     fi
     if [ ! -s "$outfile" ]; then
         LOG "Warning: $desc response is empty."
+        if [ "$allow_empty" = "1" ]; then
+            LOG "$desc returned no entries; treating as no changes."
+            : > "$outfile"
+            return 0
+        fi
         return 1
     fi
     local count
@@ -630,8 +656,10 @@ apply_full_sync() {
     if [ "$sync_ok" -eq 1 ]; then
         touch "$STATE_FILE"
         LOG "Full sync completed."
+        FEED_PULL_OK=1
     else
         LOG "Error: Full sync failed — no feeds were loaded. State file not updated."
+        FEED_PULL_OK=0
     fi
 }
 
@@ -725,7 +753,7 @@ apply_diff_sync() {
 
     local url_v6
     url_v6=$(build_feed_url "only" "yes")
-    if fetch_feed "$url_v6" "$TEMP_IPV6" "IPv6 diff"; then
+    if fetch_feed "$url_v6" "$TEMP_IPV6" "IPv6 diff" "1"; then
         generate_diff_batch "$TEMP_IPV6" "ip6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6" > "$BATCH_FILE"
 
         if [ -s "$BATCH_FILE" ]; then
@@ -738,7 +766,7 @@ apply_diff_sync() {
                 return
             fi
         else
-            LOG "IPv6 diff: no changes."
+            LOG "IPv6 diff: no changes (empty diff response accepted)."
         fi
         : > "$BATCH_FILE"
     else
@@ -748,6 +776,7 @@ apply_diff_sync() {
     fi
 
     touch "$STATE_FILE"
+    FEED_PULL_OK=1
     if [ "$had_changes" -eq 1 ]; then
         LOG "Diff sync completed with changes."
     else
@@ -857,6 +886,7 @@ source "$CONFIG_FILE"
 [ -z "$NFT_WHITELIST_SET_NAME_V6" ] && NFT_WHITELIST_SET_NAME_V6="qfeeds_whitelist_v6"
 
 STATE_FILE="/etc/qfeeds/.last_sync"
+LICENSE_CACHE_FILE="/etc/qfeeds/licenses_index.json"
 
 TEMP_IPV4=$(mktemp /tmp/qfeeds_ipv4.XXXXXX)
 TEMP_IPV6=$(mktemp /tmp/qfeeds_ipv6.XXXXXX)
@@ -882,6 +912,7 @@ fi
 
 LOG "Sync mode: $SYNC_MODE"
 
+FEED_PULL_OK=0
 if [ "$SYNC_MODE" = "diff" ]; then
     apply_diff_sync
 else
@@ -891,7 +922,14 @@ fi
 update_whitelist_sets
 save_rules
 
-LOG "Q-Feeds blocklist update completed successfully (backend: $BACKEND)."
+if [ "${FEED_PULL_OK:-0}" -eq 1 ]; then
+    refresh_license_cache || LOG "Warning: Feed pull succeeded, but failed to refresh local license cache."
+    LOG "Feed pull succeeded: Q-Feeds data was downloaded and applied (sync=$SYNC_MODE, feed_type=$FEED_TYPE)."
+    LOG "Q-Feeds blocklist update completed successfully (backend: $BACKEND)."
+else
+    LOG "Feed pull did not succeed: no blocklist data was loaded this run (sync=$SYNC_MODE, feed_type=$FEED_TYPE). See errors above."
+    LOG "Q-Feeds run finished (backend: $BACKEND); firewall setup ran but blocklist may be empty or stale."
+fi
 exit 0
 EOF
 

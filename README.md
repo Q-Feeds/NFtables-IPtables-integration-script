@@ -383,6 +383,7 @@ sudo crontab -l | grep qfeeds
 
 **"Not time yet. Next update scheduled at..."**
 - The updater respects your license schedule. This message means the cron ran, but your license doesn't allow an update yet. This is normal — the next cron run will check again.
+- The Linux installer keeps a local cached `licenses.php` index and uses the cached `next_update` as its schedule gate. After a successful pull it refreshes that local index for the next cycle.
 
 **Rules don't persist after reboot**
 - If `netfilter-persistent` is installed, rules are saved automatically
