@@ -719,7 +719,7 @@ generate_diff_batch() {
 
     if [ "$BACKEND" = "nftables" ]; then
         awk -v fam="$family" -v ipsn="$ip_setname" -v netsn="$net_setname" '
-        BEGIN { nia=0;iab=""; nid=0;idb=""; nna=0;nab=""; nnd=0;ndb="" }
+        BEGIN { nia=0;iab=""; nna=0;nab="" }
         {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "")
             if (length($0)==0||substr($0,1,1)=="#") next
@@ -735,19 +735,15 @@ generate_diff_batch() {
                 }
             } else if (p=="-") {
                 if (cidr) {
-                    if(nnd>0) ndb=ndb", "; ndb=ndb r; nnd++
-                    if(nnd>=200){print "delete element "fam" qfeeds "netsn" { "ndb" }";nnd=0;ndb=""}
+                    print "delete element "fam" qfeeds "netsn" { "r" }"
                 } else {
-                    if(nid>0) idb=idb", "; idb=idb r; nid++
-                    if(nid>=2000){print "delete element "fam" qfeeds "ipsn" { "idb" }";nid=0;idb=""}
+                    print "delete element "fam" qfeeds "ipsn" { "r" }"
                 }
             }
         }
         END {
             if(nia>0) print "add element "fam" qfeeds "ipsn" { "iab" }"
-            if(nid>0) print "delete element "fam" qfeeds "ipsn" { "idb" }"
             if(nna>0) print "add element "fam" qfeeds "netsn" { "nab" }"
-            if(nnd>0) print "delete element "fam" qfeeds "netsn" { "ndb" }"
         }
         ' "$infile"
     else
