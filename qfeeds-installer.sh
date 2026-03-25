@@ -577,15 +577,62 @@ batch_apply() {
 
         LOG "Batch nft -f failed. Falling back to per-command execution..."
 
-        local total failed=0 count=0
+        apply_nft_delete_command() {
+            local cmd="$1"
+            local count="$2"
+            local total="$3"
+            local prefix elements raw_elem elem nft_error
+            local skipped=0
+
+            if [[ "$cmd" != delete\ element* ]] || [[ "$cmd" != *"{"*"}"* ]]; then
+                return 1
+            fi
+
+            prefix="${cmd%%\{*}"
+            elements="${cmd#*\{}"
+            elements="${elements%\}*}"
+
+            IFS=',' read -r -a delete_elements <<< "$elements"
+            for raw_elem in "${delete_elements[@]}"; do
+                elem="$raw_elem"
+                elem="${elem#"${elem%%[![:space:]]*}"}"
+                elem="${elem%"${elem##*[![:space:]]}"}"
+                [ -z "$elem" ] && continue
+
+                if ! nft_error=$(nft "${prefix}{ ${elem} }" 2>&1); then
+                    if [[ "$nft_error" == *"No such file or directory"* ]]; then
+                        skipped=$((skipped + 1))
+                        continue
+                    fi
+                    [ -n "$nft_error" ] && printf '%s\n' "$nft_error" >> "$LOG_FILE"
+                    LOG "Error on delete command $count/$total for element '$elem': ${nft_error%%$'\n'*}"
+                    return 1
+                fi
+                [ -n "$nft_error" ] && printf '%s\n' "$nft_error" >> "$LOG_FILE"
+            done
+
+            if [ "$skipped" -gt 0 ]; then
+                LOG "Skipped $skipped missing delete target(s) on command $count/$total."
+            fi
+            return 0
+        }
+
+        local total failed=0 count=0 nft_error
         total=$(wc -l < "$batchfile")
         while IFS= read -r cmd; do
             count=$((count + 1))
-            if ! nft "$cmd" 2>>"$LOG_FILE"; then
+            if ! nft_error=$(nft "$cmd" 2>&1); then
+                if [[ "$cmd" == delete\ element* ]] && [[ "$nft_error" == *"No such file or directory"* ]]; then
+                    if apply_nft_delete_command "$cmd" "$count" "$total"; then
+                        continue
+                    fi
+                fi
+                [ -n "$nft_error" ] && printf '%s\n' "$nft_error" >> "$LOG_FILE"
                 LOG "Error on command $count/$total: ${cmd:0:80}..."
                 failed=1
                 break
             fi
+            [ -n "$nft_error" ] && printf '%s\n' "$nft_error" >> "$LOG_FILE"
             if [ $((count % 50)) -eq 0 ]; then
                 LOG "  Progress: $count/$total commands applied..."
             fi
