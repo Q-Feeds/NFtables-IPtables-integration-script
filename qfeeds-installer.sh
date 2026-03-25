@@ -990,8 +990,8 @@ EOF
 
 setup_cron() {
     echo "Setting up cron job..."
-    read -rp "Enter cron schedule (e.g., '*/20 * * * *') [default: */20 * * * *]: " CRON_SCHEDULE
-    CRON_SCHEDULE=${CRON_SCHEDULE:-"*/20 * * * *"}
+    read -rp "Enter cron schedule (e.g., '*/10 * * * *') [default: */10 * * * *]: " CRON_SCHEDULE
+    CRON_SCHEDULE=${CRON_SCHEDULE:-"*/10 * * * *"}
 
     # Remove any existing lines for this script, then add one fresh entry.
     # Use awk instead of grep -v because grep returns exit code 1 when no lines
