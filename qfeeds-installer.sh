@@ -244,6 +244,7 @@ install_main_script() {
 
 export PATH=$PATH:/sbin:/usr/sbin
 set -e
+HTTP_USER_AGENT="Q-Feeds_NFtables-IPtables/1.0"
 
 LOG() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : $1" | tee -a "$LOG_FILE"
@@ -326,7 +327,7 @@ refresh_license_cache() {
 
     local tmp_licenses http_status
     tmp_licenses=$(mktemp /tmp/qfeeds_licenses.XXXXXX)
-    http_status=$(curl -s -w "%{http_code}" -m 60 -o "$tmp_licenses" "$LICENSES_URL")
+    http_status=$(curl -A "$HTTP_USER_AGENT" -s -w "%{http_code}" -m 60 -o "$tmp_licenses" "$LICENSES_URL")
 
     if [ "$http_status" -ne 200 ]; then
         LOG "Warning: licenses.php returned HTTP $http_status, keeping existing cached schedule."
@@ -480,7 +481,7 @@ fetch_feed() {
     local allow_empty="${4:-0}"
     LOG "Fetching $desc..."
     local http_status
-    http_status=$(curl -s -w "%{http_code}" -m 300 -o "$outfile" "$url")
+    http_status=$(curl -A "$HTTP_USER_AGENT" -s -w "%{http_code}" -m 300 -o "$outfile" "$url")
     if [ "$http_status" -ne 200 ]; then
         LOG "Error: Failed to fetch $desc. HTTP $http_status"
         return 1
