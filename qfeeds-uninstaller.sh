@@ -86,15 +86,31 @@ remove_iptables() {
         done
     }
 
+    # Flush and delete the dedicated qfeeds chains (newer installs). Their rules
+    # still reference the ipsets, so the chains must be removed BEFORE destroying
+    # the sets, otherwise 'ipset destroy' fails ("set is in use").
+    ipt_remove_qfeeds_chain() {
+        local ipt_cmd="$1" chain="$2"
+        if "$ipt_cmd" -L "$chain" -n &>/dev/null; then
+            "$ipt_cmd" -F "$chain" 2>/dev/null || true
+            "$ipt_cmd" -X "$chain" 2>/dev/null || true
+            echo "Removed $ipt_cmd chain '$chain'."
+        fi
+    }
+
     if command -v iptables &>/dev/null; then
         ipt_remove_qfeeds_rules iptables INPUT
         ipt_remove_qfeeds_rules iptables OUTPUT
+        ipt_remove_qfeeds_chain iptables QFEEDS_INPUT
+        ipt_remove_qfeeds_chain iptables QFEEDS_OUTPUT
         echo "Removed all IPv4 iptables rules with qfeeds comment."
     fi
 
     if command -v ip6tables &>/dev/null; then
         ipt_remove_qfeeds_rules ip6tables INPUT
         ipt_remove_qfeeds_rules ip6tables OUTPUT
+        ipt_remove_qfeeds_chain ip6tables QFEEDS_INPUT
+        ipt_remove_qfeeds_chain ip6tables QFEEDS_OUTPUT
         echo "Removed all IPv6 ip6tables rules with qfeeds comment."
     fi
 
@@ -136,6 +152,19 @@ if [ "$BACKEND" = "iptables" ] || [ -z "$BACKEND" ]; then
     fi
     if command -v ipset &>/dev/null; then
         ipset save > /etc/ipset.conf 2>/dev/null || true
+    fi
+fi
+
+# When netfilter-persistent is not available, the installer persists nftables by
+# writing the full ruleset to /etc/nftables.conf. Re-write it now (without the
+# qfeeds tables we just deleted) so the blocklist does not come back on reboot.
+if [ "$BACKEND" = "nftables" ] || [ -z "$BACKEND" ]; then
+    if ! command -v netfilter-persistent &>/dev/null && command -v nft &>/dev/null; then
+        if [ -f /etc/nftables.conf ] && grep -q "qfeeds" /etc/nftables.conf 2>/dev/null; then
+            nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+            chmod 600 /etc/nftables.conf 2>/dev/null || true
+            echo "Updated /etc/nftables.conf to reflect removal of the qfeeds tables."
+        fi
     fi
 fi
 

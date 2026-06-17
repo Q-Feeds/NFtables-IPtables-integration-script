@@ -246,6 +246,10 @@ export PATH=$PATH:/sbin:/usr/sbin
 set -e
 HTTP_USER_AGENT="Q-Feeds_NFtables-IPtables/1.0"
 
+# Default log location so early LOG() calls (lock failure, cleanup trap) work
+# before the configuration file is sourced. Overridden by the config if set.
+LOG_FILE="${LOG_FILE:-/var/log/qfeeds_blocklist.log}"
+
 LOG() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : $1" | tee -a "$LOG_FILE"
 }
@@ -305,7 +309,11 @@ should_run_now() {
 
     local now_epoch next_epoch
     now_epoch=$(date -u +%s)
-    next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null || echo "")
+    # GNU date uses -d; BSD/macOS date uses -j -f. Fall back so non-GNU systems
+    # can still parse the cached "YYYY-MM-DD HH:MM:SS" schedule.
+    next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null \
+        || date -u -j -f "%Y-%m-%d %H:%M:%S" "$next_update" +%s 2>/dev/null \
+        || echo "")
 
     if [ -z "$next_epoch" ]; then
         LOG "Warning: Could not parse cached next_update='$next_update', refreshing cache and proceeding."
@@ -431,34 +439,51 @@ setup_iptables() {
     ipset create "$NFT_WHITELIST_SET_NAME_V6" hash:net family inet6 maxelem 65536 -exist
     LOG "IPv6 ipsets ready."
 
-    # Helper: insert iptables rule if not already present (idempotent via -C check)
-    ipt_add_rule() {
-        local ipt_cmd="$1"; shift
-        "$ipt_cmd" -C "$@" 2>/dev/null || "$ipt_cmd" -I "$@"
+    # Remove legacy directly-inserted rules from older versions of this script.
+    # They were added straight onto INPUT/OUTPUT with -I in an order that left
+    # the whitelist ACCEPT *below* the DROP rules (whitelist ineffective). We now
+    # use a dedicated chain instead; strip the old rules so installs self-correct.
+    remove_legacy_ipt_rules() {
+        local ipt_cmd="$1" hook="$2" dir="$3" wl="$4" ip_set="$5" net_set="$6"
+        while "$ipt_cmd" -D "$hook" -m set --match-set "$wl" "$dir" -j ACCEPT -m comment --comment "qfeeds" 2>/dev/null; do :; done
+        while "$ipt_cmd" -D "$hook" -m set --match-set "$ip_set" "$dir" -j DROP -m comment --comment "qfeeds" 2>/dev/null; do :; done
+        while "$ipt_cmd" -D "$hook" -m set --match-set "$net_set" "$dir" -j DROP -m comment --comment "qfeeds" 2>/dev/null; do :; done
+    }
+
+    # Build (or rebuild) a dedicated qfeeds chain in a deterministic order:
+    # whitelist ACCEPT first, then the blacklist DROP rules. The hook (INPUT or
+    # OUTPUT) jumps to this chain. Rebuilding each run guarantees correct order
+    # and self-corrects any previously broken ordering.
+    build_ipt_chain() {
+        local ipt_cmd="$1" chain="$2" hook="$3" dir="$4" wl="$5" ip_set="$6" net_set="$7"
+        "$ipt_cmd" -N "$chain" 2>/dev/null || true
+        "$ipt_cmd" -F "$chain"
+        "$ipt_cmd" -A "$chain" -m set --match-set "$wl" "$dir" -j ACCEPT -m comment --comment "qfeeds"
+        "$ipt_cmd" -A "$chain" -m set --match-set "$ip_set" "$dir" -j DROP -m comment --comment "qfeeds"
+        "$ipt_cmd" -A "$chain" -m set --match-set "$net_set" "$dir" -j DROP -m comment --comment "qfeeds"
+        # Ensure the hook jumps to our chain exactly once (insert at the top).
+        "$ipt_cmd" -C "$hook" -j "$chain" -m comment --comment "qfeeds" 2>/dev/null || \
+            "$ipt_cmd" -I "$hook" -j "$chain" -m comment --comment "qfeeds"
     }
 
     if [ "$BLOCK_INCOMING" = "yes" ]; then
-        ipt_add_rule iptables INPUT -m set --match-set "$NFT_WHITELIST_SET_NAME_V4" src -j ACCEPT -m comment --comment "qfeeds"
-        ipt_add_rule iptables INPUT -m set --match-set "$NFT_SET_NAME_V4" src -j DROP -m comment --comment "qfeeds"
-        ipt_add_rule iptables INPUT -m set --match-set "$NFT_NET_SET_NAME_V4" src -j DROP -m comment --comment "qfeeds"
-        LOG "IPv4 INPUT rules ready."
+        remove_legacy_ipt_rules iptables INPUT src "$NFT_WHITELIST_SET_NAME_V4" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4"
+        build_ipt_chain iptables QFEEDS_INPUT INPUT src "$NFT_WHITELIST_SET_NAME_V4" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4"
+        LOG "IPv4 INPUT chain ready (whitelist precedes blacklist)."
 
-        ipt_add_rule ip6tables INPUT -m set --match-set "$NFT_WHITELIST_SET_NAME_V6" src -j ACCEPT -m comment --comment "qfeeds"
-        ipt_add_rule ip6tables INPUT -m set --match-set "$NFT_SET_NAME_V6" src -j DROP -m comment --comment "qfeeds"
-        ipt_add_rule ip6tables INPUT -m set --match-set "$NFT_NET_SET_NAME_V6" src -j DROP -m comment --comment "qfeeds"
-        LOG "IPv6 INPUT rules ready."
+        remove_legacy_ipt_rules ip6tables INPUT src "$NFT_WHITELIST_SET_NAME_V6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6"
+        build_ipt_chain ip6tables QFEEDS_INPUT INPUT src "$NFT_WHITELIST_SET_NAME_V6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6"
+        LOG "IPv6 INPUT chain ready (whitelist precedes blacklist)."
     fi
 
     if [ "$BLOCK_OUTGOING" = "yes" ]; then
-        ipt_add_rule iptables OUTPUT -m set --match-set "$NFT_WHITELIST_SET_NAME_V4" dst -j ACCEPT -m comment --comment "qfeeds"
-        ipt_add_rule iptables OUTPUT -m set --match-set "$NFT_SET_NAME_V4" dst -j DROP -m comment --comment "qfeeds"
-        ipt_add_rule iptables OUTPUT -m set --match-set "$NFT_NET_SET_NAME_V4" dst -j DROP -m comment --comment "qfeeds"
-        LOG "IPv4 OUTPUT rules ready."
+        remove_legacy_ipt_rules iptables OUTPUT dst "$NFT_WHITELIST_SET_NAME_V4" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4"
+        build_ipt_chain iptables QFEEDS_OUTPUT OUTPUT dst "$NFT_WHITELIST_SET_NAME_V4" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4"
+        LOG "IPv4 OUTPUT chain ready (whitelist precedes blacklist)."
 
-        ipt_add_rule ip6tables OUTPUT -m set --match-set "$NFT_WHITELIST_SET_NAME_V6" dst -j ACCEPT -m comment --comment "qfeeds"
-        ipt_add_rule ip6tables OUTPUT -m set --match-set "$NFT_SET_NAME_V6" dst -j DROP -m comment --comment "qfeeds"
-        ipt_add_rule ip6tables OUTPUT -m set --match-set "$NFT_NET_SET_NAME_V6" dst -j DROP -m comment --comment "qfeeds"
-        LOG "IPv6 OUTPUT rules ready."
+        remove_legacy_ipt_rules ip6tables OUTPUT dst "$NFT_WHITELIST_SET_NAME_V6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6"
+        build_ipt_chain ip6tables QFEEDS_OUTPUT OUTPUT dst "$NFT_WHITELIST_SET_NAME_V6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6"
+        LOG "IPv6 OUTPUT chain ready (whitelist precedes blacklist)."
     fi
 }
 
@@ -648,65 +673,89 @@ batch_apply() {
     fi
 }
 
+# Flush the ip + net sets for a single address family.
+flush_family_sets() {
+    local family="$1"   # ip | ip6
+    local ip_setname="$2"
+    local net_setname="$3"
+    if [ "$BACKEND" = "nftables" ]; then
+        nft flush set "$family" qfeeds "$ip_setname" 2>/dev/null || true
+        nft flush set "$family" qfeeds "$net_setname" 2>/dev/null || true
+    else
+        ipset flush "$ip_setname" 2>/dev/null || true
+        ipset flush "$net_setname" 2>/dev/null || true
+    fi
+}
+
+# Full sync for a single address family. Fetches and validates the feed into a
+# batch file BEFORE flushing the live set, so a failed fetch/parse can never
+# leave the firewall with an empty (unprotected) set. Returns 0 only when the
+# set was successfully rebuilt with data.
+full_sync_family() {
+    local family="$1"        # ip | ip6
+    local ipv6_param="$2"    # 0 | only
+    local ip_setname="$3"
+    local net_setname="$4"
+    local tmpfile="$5"
+    local desc="$6"
+
+    local url
+    url=$(build_feed_url "$ipv6_param" "")
+    if ! fetch_feed "$url" "$tmpfile" "$desc"; then
+        LOG "Error: $desc fetch failed; keeping existing set (not flushed)."
+        return 1
+    fi
+
+    batch_load_set "$tmpfile" "$family" "$ip_setname" "$net_setname" > "$BATCH_FILE"
+    if [ ! -s "$BATCH_FILE" ]; then
+        LOG "Warning: $desc produced no loadable entries; keeping existing set (not flushed)."
+        : > "$BATCH_FILE"
+        return 1
+    fi
+
+    local batch_lines
+    batch_lines=$(wc -l < "$BATCH_FILE")
+    LOG "Loading $desc: $batch_lines commands..."
+
+    # Data is validated and in hand: now it is safe to flush + reload.
+    flush_family_sets "$family" "$ip_setname" "$net_setname"
+    if batch_apply "$BATCH_FILE"; then
+        LOG "$desc loaded successfully."
+        : > "$BATCH_FILE"
+        return 0
+    fi
+
+    LOG "Error: batch apply failed for $desc."
+    : > "$BATCH_FILE"
+    return 1
+}
+
 apply_full_sync() {
     LOG "Starting full sync..."
-    local sync_ok=0
+    local v4_ok=0 v6_ok=0
 
-    if [ "$BACKEND" = "nftables" ]; then
-        nft flush set ip qfeeds "$NFT_SET_NAME_V4" 2>/dev/null || true
-        nft flush set ip qfeeds "$NFT_NET_SET_NAME_V4" 2>/dev/null || true
-        nft flush set ip6 qfeeds "$NFT_SET_NAME_V6" 2>/dev/null || true
-        nft flush set ip6 qfeeds "$NFT_NET_SET_NAME_V6" 2>/dev/null || true
-    else
-        ipset flush "$NFT_SET_NAME_V4" 2>/dev/null || true
-        ipset flush "$NFT_NET_SET_NAME_V4" 2>/dev/null || true
-        ipset flush "$NFT_SET_NAME_V6" 2>/dev/null || true
-        ipset flush "$NFT_NET_SET_NAME_V6" 2>/dev/null || true
-    fi
-    LOG "Flushed blacklist sets for full sync."
-
-    local url_v4
-    url_v4=$(build_feed_url "0" "")
-    if fetch_feed "$url_v4" "$TEMP_IPV4" "IPv4 feed"; then
-        batch_load_set "$TEMP_IPV4" "ip" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4" > "$BATCH_FILE"
-        if [ -s "$BATCH_FILE" ]; then
-            local batch_lines
-            batch_lines=$(wc -l < "$BATCH_FILE")
-            LOG "Loading IPv4 blacklist: $batch_lines commands..."
-            if batch_apply "$BATCH_FILE"; then
-                LOG "IPv4 blacklist loaded successfully."
-                sync_ok=1
-            else
-                LOG "Error: batch apply failed for IPv4 blacklist."
-            fi
-        fi
-        : > "$BATCH_FILE"
+    if full_sync_family "ip" "0" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4" "$TEMP_IPV4" "IPv4 feed"; then
+        v4_ok=1
     fi
 
-    local url_v6
-    url_v6=$(build_feed_url "only" "")
-    if fetch_feed "$url_v6" "$TEMP_IPV6" "IPv6 feed"; then
-        batch_load_set "$TEMP_IPV6" "ip6" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6" > "$BATCH_FILE"
-        if [ -s "$BATCH_FILE" ]; then
-            local batch_lines_v6
-            batch_lines_v6=$(wc -l < "$BATCH_FILE")
-            LOG "Loading IPv6 blacklist: $batch_lines_v6 commands..."
-            if batch_apply "$BATCH_FILE"; then
-                LOG "IPv6 blacklist loaded successfully."
-                sync_ok=1
-            else
-                LOG "Error: batch apply failed for IPv6 blacklist."
-            fi
-        fi
-        : > "$BATCH_FILE"
+    if full_sync_family "ip6" "only" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6" "$TEMP_IPV6" "IPv6 feed"; then
+        v6_ok=1
     fi
 
-    if [ "$sync_ok" -eq 1 ]; then
+    if [ "$v4_ok" -eq 1 ] && [ "$v6_ok" -eq 1 ]; then
         touch "$STATE_FILE"
-        LOG "Full sync completed."
+        LOG "Full sync completed (IPv4 + IPv6)."
         FEED_PULL_OK=1
     else
-        LOG "Error: Full sync failed — no feeds were loaded. State file not updated."
+        # Do NOT advance the state file on a partial/failed full sync, and remove
+        # it so the next run retries a full sync instead of diffing onto a set
+        # that may be partially loaded or stale.
+        rm -f "$STATE_FILE" 2>/dev/null || true
+        if [ "$v4_ok" -eq 1 ] || [ "$v6_ok" -eq 1 ]; then
+            LOG "Error: Full sync only partially succeeded (v4_ok=$v4_ok v6_ok=$v6_ok). State file cleared; next run will retry a full sync."
+        else
+            LOG "Error: Full sync failed — no feeds were loaded. State file cleared; next run will retry a full sync."
+        fi
         FEED_PULL_OK=0
     fi
 }
@@ -773,7 +822,10 @@ apply_diff_sync() {
 
     local url_v4
     url_v4=$(build_feed_url "0" "yes")
-    if fetch_feed "$url_v4" "$TEMP_IPV4" "IPv4 diff"; then
+    # allow_empty=1: an empty diff means "no changes since last pull", which is
+    # normal during quiet cycles and must NOT be treated as a fetch failure
+    # (otherwise every quiet cycle would trigger a full ~600k flush+reload).
+    if fetch_feed "$url_v4" "$TEMP_IPV4" "IPv4 diff" "1"; then
         generate_diff_batch "$TEMP_IPV4" "ip" "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4" > "$BATCH_FILE"
 
         if [ -s "$BATCH_FILE" ]; then
@@ -876,8 +928,19 @@ save_rules() {
             netfilter-persistent save
             LOG "Saved nftables rules using netfilter-persistent."
         else
-            LOG "Note: Persist your nft rules with something like:"
-            LOG "  nft list ruleset > /etc/nftables.conf"
+            # netfilter-persistent is not available: persist the full ruleset
+            # ourselves so the blocklist survives a reboot. nft list ruleset
+            # dumps ALL currently loaded tables, so this preserves any other
+            # firewall configuration that is already active.
+            if nft list ruleset > /etc/nftables.conf 2>/dev/null; then
+                chmod 600 /etc/nftables.conf 2>/dev/null || true
+                LOG "WARNING: netfilter-persistent not found. Wrote current ruleset to /etc/nftables.conf so the blocklist persists across reboots."
+                if command -v systemctl &>/dev/null; then
+                    systemctl enable nftables &>/dev/null || true
+                fi
+            else
+                LOG "WARNING: Could not persist the nftables ruleset. The blocklist will be LOST on reboot. Install netfilter-persistent or enable the nftables service."
+            fi
         fi
     else
         ipset save > /etc/ipset.conf 2>/dev/null || true
@@ -892,6 +955,33 @@ save_rules() {
             LOG "Saved rules using netfilter-persistent."
         fi
     fi
+}
+
+# Returns the total number of elements currently loaded across the v4/v6
+# blacklist sets (individual IPs + CIDR/net sets). Used to detect a local set
+# that has lost its baseline (e.g. after a reboot, manual flush, or a partial
+# sync) so we can force a full rebuild instead of diffing onto an empty set.
+get_blacklist_count() {
+    local total=0 c family setname set_spec
+
+    if [ "$BACKEND" = "nftables" ]; then
+        for set_spec in "ip $NFT_SET_NAME_V4" "ip $NFT_NET_SET_NAME_V4" "ip6 $NFT_SET_NAME_V6" "ip6 $NFT_NET_SET_NAME_V6"; do
+            family=${set_spec%% *}
+            setname=${set_spec#* }
+            c=$(nft -j list set "$family" qfeeds "$setname" 2>/dev/null | \
+                jq '[.nftables[] | select(.set) | (.set.elem // [] | length)] | add // 0' 2>/dev/null)
+            [ -z "$c" ] && c=0
+            total=$((total + c))
+        done
+    else
+        for setname in "$NFT_SET_NAME_V4" "$NFT_NET_SET_NAME_V4" "$NFT_SET_NAME_V6" "$NFT_NET_SET_NAME_V6"; do
+            c=$(ipset list -t "$setname" 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')
+            [ -z "$c" ] && c=0
+            total=$((total + c))
+        done
+    fi
+
+    echo "$total"
 }
 
 # ================================
@@ -931,6 +1021,12 @@ source "$CONFIG_FILE"
 
 STATE_FILE="/etc/qfeeds/.last_sync"
 LICENSE_CACHE_FILE="/etc/qfeeds/licenses_index.json"
+# Records the element count after the last successful sync. Used to detect a
+# local set that has lost its baseline so diff mode does not patch an empty set.
+COUNT_FILE="/etc/qfeeds/.last_count"
+# Force a periodic full re-sync so any slow diff drift self-heals (seconds).
+# Can be overridden in the config file. Default: 24h.
+FULL_SYNC_MAX_AGE="${FULL_SYNC_MAX_AGE:-86400}"
 
 TEMP_IPV4=$(mktemp /tmp/qfeeds_ipv4.XXXXXX)
 TEMP_IPV6=$(mktemp /tmp/qfeeds_ipv6.XXXXXX)
@@ -950,6 +1046,41 @@ if [ "$QFEEDS_FORCE_UPDATE" = "1" ] || [ ! -f "$STATE_FILE" ]; then
     SYNC_MODE="full"
 elif [ "$FEED_TYPE" = "malware_ip" ]; then
     SYNC_MODE="diff"
+
+    # Defense in depth: force a periodic full re-sync so diff drift self-heals.
+    if [ -n "$FULL_SYNC_MAX_AGE" ] && [ "$FULL_SYNC_MAX_AGE" -gt 0 ] 2>/dev/null; then
+        state_mtime=$(stat -c %Y "$STATE_FILE" 2>/dev/null || stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)
+        state_age=$(( $(date -u +%s) - state_mtime ))
+        if [ "$state_age" -ge "$FULL_SYNC_MAX_AGE" ]; then
+            LOG "Last sync is ${state_age}s old (>= ${FULL_SYNC_MAX_AGE}s); forcing full sync."
+            SYNC_MODE="full"
+        fi
+    fi
+
+    # Sanity check: never trust diff mode if the local set has lost its baseline
+    # (reboot without persistence, manual flush, or a prior partial sync). The
+    # STATE_FILE living on disk does NOT prove the in-memory set is populated.
+    if [ "$SYNC_MODE" = "diff" ]; then
+        live_count=$(get_blacklist_count)
+        expected_count=0
+        if [ -f "$COUNT_FILE" ]; then
+            expected_count=$(tr -d '[:space:]' < "$COUNT_FILE" 2>/dev/null)
+        fi
+        [ -z "$expected_count" ] && expected_count=0
+        if ! [ "$live_count" -ge 0 ] 2>/dev/null; then
+            live_count=0
+        fi
+
+        if [ "$live_count" -eq 0 ]; then
+            LOG "Local blacklist is empty (live count = 0); forcing full sync to rebuild the baseline."
+            SYNC_MODE="full"
+        elif [ "$expected_count" -gt 0 ] && [ "$live_count" -lt $((expected_count / 2)) ]; then
+            LOG "Local blacklist count ($live_count) is far below expected ($expected_count); forcing full sync to rebuild the baseline."
+            SYNC_MODE="full"
+        else
+            LOG "Local blacklist baseline OK (live count = $live_count, expected = $expected_count)."
+        fi
+    fi
 else
     SYNC_MODE="full"
 fi
@@ -967,6 +1098,13 @@ update_whitelist_sets
 save_rules
 
 if [ "${FEED_PULL_OK:-0}" -eq 1 ]; then
+    # Record the healthy element count so the next run can detect a lost baseline.
+    new_count=$(get_blacklist_count)
+    if [ "$new_count" -gt 0 ] 2>/dev/null; then
+        echo "$new_count" > "$COUNT_FILE" 2>/dev/null || true
+        chmod 600 "$COUNT_FILE" 2>/dev/null || true
+        LOG "Recorded blacklist baseline count: $new_count"
+    fi
     refresh_license_cache || LOG "Warning: Feed pull succeeded, but failed to refresh local license cache."
     LOG "Feed pull succeeded: Q-Feeds data was downloaded and applied (sync=$SYNC_MODE, feed_type=$FEED_TYPE)."
     LOG "Q-Feeds blocklist update completed successfully (backend: $BACKEND)."
