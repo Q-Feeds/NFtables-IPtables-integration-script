@@ -74,7 +74,7 @@ This solution periodically downloads the latest threat intelligence feed from Q-
 - ✅ **Fast** — loads 400k+ IPs in seconds using optimized hash sets (nftables) or ipset (iptables)
 - ✅ **Safe** — uses dedicated tables/sets — never touches your existing firewall rules
 - ✅ **Efficient** — diff-based updates only process changes, not the full list
-- ✅ **Reliable** — automatic fallback to full sync if a diff fails
+- ✅ **Reliable** — self-healing: detects an empty or incomplete local set (e.g. after a reboot) and rebuilds it, with automatic fallback to a full sync if a diff fails
 - ✅ **Flexible** — choose incoming/outgoing blocking, optional whitelist
 
 ---
@@ -149,11 +149,14 @@ Both backends use the same split-set strategy for maximum performance:
 │  │ (hash:net)              │                             │
 │  └─────────────────────────┘                             │
 │                                                          │
-│  iptables rules (tagged with -m comment "qfeeds"):       │
-│    INPUT  -m set --match-set whitelist_v4 src -j ACCEPT  │
-│    INPUT  -m set --match-set blacklist_v4 src -j DROP    │
-│    INPUT  -m set --match-set blacklist_v4_nets src -j DROP│
-│    OUTPUT (if enabled) — same pattern with dst            │
+│  iptables: INPUT/OUTPUT jump to a dedicated chain        │
+│  (jump rule tagged -m comment "qfeeds"):                 │
+│                                                          │
+│  chain QFEEDS_INPUT (rebuilt each run, in order):        │
+│    -m set --match-set whitelist_v4 src -j ACCEPT         │
+│    -m set --match-set blacklist_v4 src -j DROP           │
+│    -m set --match-set blacklist_v4_nets src -j DROP      │
+│    (QFEEDS_OUTPUT mirrors this with dst, if enabled)     │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -185,10 +188,12 @@ The same structure exists for IPv6 (`ip6 qfeeds` table or `ip6tables` + `family 
 
 | Mode | When | What it does |
 |------|------|-------------|
-| **Full sync** | First run, forced update, or after diff failure | Flushes all blacklist sets and reloads from scratch |
-| **Diff sync** | Subsequent runs (`malware_ip` feed only) | Fetches only additions (`+`) and removals (`-`) since last pull |
+| **Full sync** | First run, forced update, after a diff failure, when the local set has lost its baseline (empty or much smaller than expected), or when the last sync is older than `FULL_SYNC_MAX_AGE` (default 24h) | Fetches and validates each feed first, then flushes and reloads the blacklist sets. The set is only flushed once valid data is in hand, so a failed fetch never leaves you unprotected |
+| **Diff sync** | Subsequent runs (`malware_ip` feed only) with a healthy local set | Fetches only additions (`+`) and removals (`-`) since last pull |
 
 The diff sync is **per API key** — the API tracks your last successful pull and only returns changes since then. If a diff fails, the script automatically falls back to a full sync.
+
+> **Self-healing:** Diff updates only patch the existing set. If that set is ever lost or truncated — for example a reboot where the firewall rules were not persisted, a manual flush, or a previous partial sync — the updater detects the missing baseline (live element count is 0 or far below the last recorded count) and forces a full rebuild instead of diffing onto an empty set. As an extra safety net it also forces a periodic full sync (every 24h by default, via `FULL_SYNC_MAX_AGE`).
 
 ### License-Based Scheduling
 
@@ -301,6 +306,7 @@ All settings are stored in `/etc/qfeeds/qfeeds_config.conf`. You can edit this f
 | `WHITELIST_V4` | Comma-separated IPv4 whitelist | *(empty)* |
 | `WHITELIST_V6` | Comma-separated IPv6 whitelist | *(empty)* |
 | `LOG_FILE` | Path to log file | `/var/log/qfeeds_blocklist.log` |
+| `FULL_SYNC_MAX_AGE` | Max age in seconds before a full re-sync is forced (defense in depth) | `86400` (24h) |
 
 ### Files Created by the Installer
 
@@ -308,6 +314,7 @@ All settings are stored in `/etc/qfeeds/qfeeds_config.conf`. You can edit this f
 |------|---------|
 | `/etc/qfeeds/qfeeds_config.conf` | Configuration file |
 | `/etc/qfeeds/.last_sync` | State file for full/diff sync tracking |
+| `/etc/qfeeds/.last_count` | Last successful element count, used to detect a lost baseline |
 | `/usr/local/bin/update_qfeeds_blocklist.sh` | Updater script (runs via cron) |
 | `/var/log/qfeeds_blocklist.log` | Log file |
 
@@ -343,9 +350,10 @@ ipset list qfeeds_blacklist_v4 | tail -n +9 | wc -l
 # Show loaded CIDR ranges
 ipset list qfeeds_blacklist_v4_nets | tail -n +9 | head -20
 
-# Show iptables rules with qfeeds comment
+# Show the qfeeds jump rule in INPUT, then the dedicated chain's block rules
 iptables -L INPUT -n --line-numbers | grep qfeeds
-ip6tables -L INPUT -n --line-numbers | grep qfeeds
+iptables -L QFEEDS_INPUT -n
+ip6tables -L QFEEDS_INPUT -n
 ```
 
 ### Common commands (both backends)
@@ -387,9 +395,9 @@ sudo crontab -l | grep qfeeds
 
 **Rules don't persist after reboot**
 - If `netfilter-persistent` is installed, rules are saved automatically
-- **nftables**: manually save with `nft list ruleset > /etc/nftables.conf`
-- **iptables**: manually save with `iptables-save > /etc/iptables.rules` and `ipset save > /etc/ipset.conf`
-- The cron job will also reload the rules on the next run
+- **nftables**: if `netfilter-persistent` is absent, the updater now writes the full ruleset to `/etc/nftables.conf` automatically and enables the `nftables` service; you can still save manually with `nft list ruleset > /etc/nftables.conf`
+- **iptables**: the updater saves with `ipset save > /etc/ipset.conf` and `iptables-save`; you can also save manually
+- Even if persistence fails entirely, the updater self-heals: on the next run it detects the empty set after a reboot and rebuilds it with a full sync
 
 ### nftables-specific
 
@@ -410,8 +418,9 @@ sudo crontab -l | grep qfeeds
 - Ensure the ipset module is loaded: `lsmod | grep ip_set`
 
 **iptables rules not showing up**
-- Verify rules with: `iptables -L INPUT -n | grep qfeeds`
-- The rules use `-m comment --comment "qfeeds"` for identification
+- The blocking rules live in the dedicated `QFEEDS_INPUT` / `QFEEDS_OUTPUT` chains; `INPUT`/`OUTPUT` only hold a `-j QFEEDS_INPUT` jump tagged with the `qfeeds` comment
+- Verify with: `iptables -L INPUT -n | grep qfeeds` (the jump) and `iptables -L QFEEDS_INPUT -n` (the block rules)
+- The jump rule uses `-m comment --comment "qfeeds"` for identification
 - Ensure the `xt_set` module is loaded: `modprobe xt_set`
 
 **"ipset create ... failed"**
@@ -431,7 +440,8 @@ The uninstaller removes everything based on the detected backend:
 - Deletes `ip qfeeds` and `ip6 qfeeds` tables (including all chains, rules, and sets)
 
 **iptables backend:**
-- Removes all iptables/ip6tables rules tagged with the `qfeeds` comment
+- Removes all iptables/ip6tables rules tagged with the `qfeeds` comment (including the jump rules)
+- Flushes and deletes the `QFEEDS_INPUT` / `QFEEDS_OUTPUT` chains
 - Destroys all ipset sets (`qfeeds_blacklist_v4`, `qfeeds_blacklist_v4_nets`, `qfeeds_whitelist_v4`, and IPv6 equivalents)
 
 **Both backends:**
