@@ -287,6 +287,15 @@ Enter cron schedule (e.g., '*/20 * * * *') [default: */20 * * * *]:
 
 How often the updater checks for new data. Default is every 20 minutes. The license-based scheduling ensures the API is only called when your license allows an update.
 
+> **Re-running the installer with a customized crontab:** If a Q-Feeds cron entry already exists, the installer asks before touching it:
+>
+> ```
+> An existing Q-Feeds cron entry was found in the current crontab.
+> Replace it with a fresh default entry? Choosing 'no' keeps your crontab unchanged [y/N]:
+> ```
+>
+> Answer `no` (the default) to keep your existing crontab. A clean first install has no existing entry and skips this prompt. For unattended installs, set `QFEEDS_SKIP_CRON=1` to leave the crontab untouched without prompting.
+
 ---
 
 ## ⚙️ Configuration
@@ -466,6 +475,8 @@ This project is licensed under the **Apache License 2.0** - see the [LICENSE](LI
 **Use at your own risk.**
 
 Please test these scripts in your environment before deploying them in production. The author is not responsible for any issues or damages that may occur from their use.
+
+> **AI assistance:** Parts of this project (code, fixes, and documentation) were written with the help of AI tools and subsequently reviewed by maintainers. While we test and review changes, please review the scripts yourself before running them and report anything that looks off.
 
 ---
 

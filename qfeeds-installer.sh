@@ -1124,6 +1124,35 @@ EOF
 
 setup_cron() {
     echo "Setting up cron job..."
+
+    # Allow non-interactive installs to skip cron management entirely.
+    if [ "$QFEEDS_SKIP_CRON" = "1" ]; then
+        echo "QFEEDS_SKIP_CRON=1 set; leaving the crontab unchanged."
+        echo "Make sure a line like this exists so updates keep running:"
+        echo "  */10 * * * * $CRON_CMD"
+        return 0
+    fi
+
+    # If a Q-Feeds cron entry already exists, the installer would normally strip
+    # every line referencing the updater and replace them with one default entry.
+    # That also removes any customized lines (e.g. a Zabbix counter or @reboot
+    # entry), so offer to leave the crontab untouched instead. A clean first
+    # install has no such entry and proceeds without this extra prompt.
+    if crontab -l 2>/dev/null | grep -Fq "$CRON_CMD"; then
+        echo "An existing Q-Feeds cron entry was found in the current crontab."
+        read -rp "Replace it with a fresh default entry? Choosing 'no' keeps your crontab unchanged [y/N]: " MANAGE_CRON
+        case "$MANAGE_CRON" in
+            [yY][eE][sS]|[yY])
+                ;;
+            *)
+                echo "Keeping your existing crontab unchanged."
+                echo "Make sure a line like this remains so updates keep running:"
+                echo "  */10 * * * * $CRON_CMD"
+                return 0
+                ;;
+        esac
+    fi
+
     read -rp "Enter cron schedule (e.g., '*/10 * * * *') [default: */10 * * * *]: " CRON_SCHEDULE
     CRON_SCHEDULE=${CRON_SCHEDULE:-"*/10 * * * *"}
 
