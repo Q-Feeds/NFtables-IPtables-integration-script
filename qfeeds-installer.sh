@@ -1135,8 +1135,7 @@ setup_cron() {
 
     # If a Q-Feeds cron entry already exists, the installer would normally strip
     # every line referencing the updater and replace them with one default entry.
-    # That also removes any customized lines (e.g. a Zabbix counter or @reboot
-    # entry), so offer to leave the crontab untouched instead. A clean first
+    # That also removes any customized lines so offer to leave the crontab untouched instead. A clean first
     # install has no such entry and proceeds without this extra prompt.
     if crontab -l 2>/dev/null | grep -Fq "$CRON_CMD"; then
         echo "An existing Q-Feeds cron entry was found in the current crontab."
