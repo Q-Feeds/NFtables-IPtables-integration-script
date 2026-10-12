@@ -60,7 +60,7 @@ Your server is now protected. The cron job checks for updates every 20 minutes (
 
 ## 📖 Overview
 
-This solution periodically downloads the latest threat intelligence feed from Q-Feeds and applies it as firewall rules, allowing you to:
+This solution periodically downloads the latest threat intelligence feed from Q-Feeds and applies it as firewall rules (step-by-step guide: [NFtables/IPtables setup](https://qfeeds.com/knowledge-base/nftables-iptables-setup/)), allowing you to:
 
 - ✅ **Block incoming connections** from known malicious IPs
 - ✅ **Block outgoing connections** to known malicious IPs
